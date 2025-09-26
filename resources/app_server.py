@@ -2773,7 +2773,7 @@ def main():
     atexit.register(GPIO.cleanup)
     
     uvicorn.run(
-        "testKatFittingRoom:app",
+        "app_server:app",
         host=args.host,
         port=args.port,
         reload=False
