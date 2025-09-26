@@ -172,7 +172,10 @@ def draw_counts(frame, class_counters, label):
     
     class_names = {
     0: "",
-    1: "bottle",
+    1: "100plus",
+    2: "cocacola",
+    3: "coconut",
+    4: "lemon",
  
 }
     
