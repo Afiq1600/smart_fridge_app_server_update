@@ -1,5 +1,5 @@
 from fastapi import FastAPI, WebSocket 
-import uvicorn 
+import uvicorn asdadasdasd
 import cv2
 import argparse
 import os
