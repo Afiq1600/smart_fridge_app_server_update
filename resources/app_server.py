@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket adsadasdasdasda
+from fastapi import FastAPI, WebSocket 
 import uvicorn
 import cv2
 import argparse
