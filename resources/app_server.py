@@ -142,31 +142,18 @@ def compute_color_for_labels(label):
 object_trails = defaultdict(lambda: deque(maxlen=30))
 global_trails = defaultdict(lambda: deque(maxlen=30))
 
-def draw_trail(frame, track_id, center, color, global_id=None):
-    """
-    Draw movement trail for a tracked object
-    Args:
-        frame: Frame to draw on
-        track_id: Local track ID or global ID
-        center: Current center point (x, y)
-        color: Color for drawing
-        global_id: Global ID for this track (if available)
-    """
-    # If global_id is provided, use global trails
-    if global_id is not None:
-        global_trails[global_id].appendleft(center)
-        points = list(global_trails[global_id])
-    else:
-        # Use track_id as the key (could be local or global ID)
-        object_trails[track_id].appendleft(center)
-        points = list(object_trails[track_id])
+def draw_trail(frame, track_id, center, color):
+    if track_id not in data_deque:
+        data_deque[track_id] = deque(maxlen=64)
     
-    # Draw the trail
-    for i in range(1, len(points)):
-        if points[i - 1] is None or points[i] is None:
+    data_deque[track_id].appendleft(center)
+    cv2.circle(frame, center, 5, color, -1)
+    
+    for i in range(1, len(data_deque[track_id])):
+        if data_deque[track_id][i - 1] is None or data_deque[track_id][i] is None:
             continue
-        thickness = int(np.sqrt(64 / float(i + 1)) * 2)
-        cv2.line(frame, points[i - 1], points[i], color, thickness)
+        thickness = int(np.sqrt(64 / float(i + 1)) * 1.5)
+        cv2.line(frame, data_deque[track_id][i - 1], data_deque[track_id][i], color, thickness)
 
 def draw_counts(frame, class_counters, label):
     
@@ -237,16 +224,18 @@ def handle_alert_state():
         GPIO.output(LED_RED, GPIO.LOW)   # Turn LED off
         time.sleep(0.5)
 
-def calculate_total_price_and_control_buzzer(current_data, deposit):
+def calculate_total_price_and_control_buzzer(current_data, deposit, label=None):
     """
     Calculate total price for validated items and control buzzer based on deposit comparison
     """
-    global blink, alert_thread, price_alert_sound_playing
+    global blink, alert_thread, price_alert_sound_playing, last_alerted_label
     total_product_price = 0
     
-    # Process validated products
+    # Process validated products and track which ones exceed deposit
     validated_products = current_data.get("validated_products", {})
     all_products = set(validated_products.get("entry", {}).keys()) | set(validated_products.get("exit", {}).keys())
+    
+    product_prices = {}  # Store individual product contributions
     
     for product_name in all_products:
         entry_data = validated_products.get("entry", {}).get(product_name, {"count": 0})
@@ -259,31 +248,44 @@ def calculate_total_price_and_control_buzzer(current_data, deposit):
         if product_details and "product_price" in product_details:
             price_per_unit = float(product_details["product_price"])
             true_count = max(0, exit_count - entry_count)
-            total_product_price += true_count * price_per_unit
+            product_total = true_count * price_per_unit
+            
+            if true_count > 0:  # Only track products that are actually taken
+                product_prices[product_name] = product_total
+                total_product_price += product_total
     
     # Control buzzer, LED, and sound based on price comparison
     if total_product_price > deposit:
-        GPIO.output(BUZZER_PIN, GPIO.LOW)  # Turn buzzer on
         blink = True
         
-        # Start price alert sound if not already playing
-        if not price_alert_sound_playing:
+        # Get all products that need to be returned, sorted by price (highest first)
+        products_to_return = sorted(product_prices.items(), key=lambda x: x[1], reverse=True)
+        
+        # Create list of product names
+        products_list = [p[0] for p in products_to_return]
+        
+        # Convert list to string for comparison (to check if alert needs updating)
+        products_str = ",".join(products_list)
+        
+        # Start price alert sound if not already playing or if the alerted products changed
+        if products_list and (not price_alert_sound_playing or last_alerted_label != products_str):
             price_alert_sound_playing = True
-            tts_manager.play_mp3_async("sounds/siren1.mp3", volume=1.0)
-            print(f"Price alert: ${total_product_price:.2f} > ${deposit:.2f} - playing alert sound")
+            tts_manager.speak_deposit(products_list)  # Pass list of products
+            last_alerted_label = products_str
+            print(f"Price alert: ${total_product_price:.2f} > ${deposit:.2f} - Please return {products_str}")
         
         # Start LED blinking in a new thread if not already running
         if alert_thread is None or not alert_thread.is_alive():
             alert_thread = threading.Thread(target=handle_alert_state, daemon=True)
             alert_thread.start()
     else:
-        GPIO.output(BUZZER_PIN, GPIO.HIGH)  # Turn buzzer off
         blink = False
         GPIO.output(LED_RED, GPIO.LOW)  # Ensure LED is off
         
         # Stop price alert sound if it was playing
         if price_alert_sound_playing:
             price_alert_sound_playing = False
+            last_alerted_label = None
             # Only stop audio if camera is not covered (to avoid stopping camera alert)
             if not camera_covered_sound_playing:
                 tts_manager.stop_all_audio()
@@ -310,6 +312,7 @@ import subprocess
 # Add these global variables at the top of your file
 camera_covered_sound_playing = False
 price_alert_sound_playing = False
+last_alerted_label = None
 
 def is_frame_dark(frame, threshold=40):
     """
@@ -332,31 +335,52 @@ def is_frame_dark(frame, threshold=40):
     avg_brightness = np.mean(gray)
     is_dark = avg_brightness < threshold
     
-    # Handle sound playback for camera coverage
-    if is_dark and not camera_covered_sound_playing:
-        # Start playing camera covered alert sound
-        camera_covered_sound_playing = True
-        tts_manager.play_mp3_async("sounds/siren1.mp3", volume=1.0)
-        print("Camera covered - playing alert sound")
-    elif not is_dark and camera_covered_sound_playing:
-        # Stop camera covered alert sound
-        camera_covered_sound_playing = False
-        tts_manager.stop_all_audio()
-        print("Camera uncovered - stopping alert sound")
+
     
     return is_dark
 
 
+def setup_cover_alert_sound():
+    """Generate and save the camera cover alert sound using TTS"""
+    alert_dir = "sounds/cover_alerts"
+    alert_file = os.path.join(alert_dir, "camera_covered.mp3")
+    
+    # Create directory if it doesn't exist
+    os.makedirs(alert_dir, exist_ok=True)
+    
+    # Generate the alert message if it doesn't exist
+    if not os.path.exists(alert_file):
+        alert_text = "Dont cover the camera. Please uncover the camera immediately."
+        tts = gTTS(text=alert_text, lang='en', slow=False)
+        tts.save(alert_file)
+        print(f"Cover alert sound saved to {alert_file}")
+    
+    return alert_file
+
 def handle_cover_alert():
-    """Handle buzzer alert when camera is covered"""
+    """Handle audio alert when camera is covered"""
     global camera_covered
+    
+    # Get or create the alert sound file
+    alert_sound = setup_cover_alert_sound()
+    
+    print("Camera covered - playing alert sound")
+    
     while camera_covered:
         if GPIO.input(DOOR_SWITCH_PIN) == 0:  # Check if door is closed
-            GPIO.output(BUZZER_PIN, GPIO.HIGH)  # Turn buzzer off
+            print("Door closed - stopping alert sound")
             break
-        GPIO.output(BUZZER_PIN, GPIO.LOW)  # Turn buzzer on
-        #time.sleep(0.1)  # Short sleep to allow for more responsive checking
-    GPIO.output(BUZZER_PIN, GPIO.HIGH)  # Ensure buzzer is off when exiting
+        
+        # Play the cover alert sound using tts_manager
+        tts_manager.play_mp3_async(alert_sound, volume=0.8)
+        
+        # Wait for a reasonable interval before repeating
+        # Adjust based on the length of your TTS message
+        time.sleep(3.0)
+    
+    # Stop audio when exiting
+    #tts_manager.stop_all_audio()
+    print("Camera uncovered - stopping alert sound")
 
 
 def display_user_data_frame(user_data):
@@ -395,7 +419,7 @@ def display_user_data_frame(user_data):
                 # Create video writer on first frame to get dimensions
                 if output_video is None:
                     height, width = frame.shape[:2]
-                    output_video = cv2.VideoWriter(filename, fourcc, 10.0, (width, height), isColor=True)
+                    output_video = cv2.VideoWriter(filename, fourcc, 25.0, (width, height), isColor=True)
                     print(f"Started recording to: {filename}")
                 
                 # Write frame to video
@@ -1125,7 +1149,7 @@ class HailoDetectionCallback(app_callback_class):
                 
                 print("Initial planogram fetched and stored in environment:")
                 for product in machine_planogram:
-                    print(f"Product library ID: {product['product_library_id']}, Name: {product['product_name']}")
+                    print(f"Product library ID: {product['product_library_id']}, Name: {product['product_name']}, price: {product['product_price']}")
                     
             else:
                 print(f"Initial API request failed: {api_response.status_code}")
@@ -1506,7 +1530,7 @@ class HailoDetectionApp:
         
         
         # Connect callbacks for both identity elements
-        for stream_id in [0, 1]:
+        for stream_id in [0]:
             identity = self.pipeline.get_by_name(f"identity_callback_{stream_id}")
             if identity:
                 pad = identity.get_static_pad("src")
@@ -1596,186 +1620,449 @@ class HailoDetectionApp:
             self.pipeline.set_state(Gst.State.NULL)
             cv2.destroyAllWindows()
 
-from scipy.spatial import distance
+# Global tracking dictionaries
+movement_history = defaultdict(lambda: deque(maxlen=10))
+bbox_area_history = defaultdict(lambda: deque(maxlen=10))
+movement_direction = {}
+last_counted_direction = {}
 
-
-# Global variables for cross-camera tracking
-global_track_counter = 0
-local_to_global_id_map = {}  # Maps (camera_id, local_track_id) to global_track_id
-global_movement_history = defaultdict(deque)  # Movement history for global IDs
-global_last_counted_direction = {}  # Last counted direction for global IDs
-global_track_labels = {}  # Store labels for each global ID
-
-# New structure to track active objects per camera and label
-active_objects_per_camera = {
-    0: defaultdict(dict),  # camera_id -> label -> {local_track_id: global_track_id}
-    1: defaultdict(dict)
-}
-
-# Cross-camera matching candidates
-cross_camera_candidates = defaultdict(list)  # label -> [list of (camera_id, local_track_id, global_track_id)]
-
-# Adjust the movement_history and last_counted_direction to be per-camera
-camera_movement_history = {
-    0: defaultdict(lambda: deque(maxlen=5)),
-    1: defaultdict(lambda: deque(maxlen=5))
-}
-
-def get_global_track_id(camera_id, local_track_id, features=None, label=None):
+def analyze_movement_direction(track_id, center, tracking_data, current_bbox):
     """
-    Get or create a global track ID for the given local track ID and camera.
-    
-    Logic:
-    1. Same local_track_id on same camera always gets same global_id
-    2. Different local_track_ids with same label on same camera get different global_ids
-    3. Objects with same label on different cameras get same global_id (cross-camera matching)
-    4. Multiple objects with same label on different cameras get different global_ids
+    Analyze movement direction based on 5 consecutive frames with enhanced filtering
     
     Args:
-        camera_id: ID of the camera
-        local_track_id: Local track ID assigned by the tracker
-        features: Feature vector (ignored for now)
-        label: Class label of the detected object
-    Returns:
-        Global track ID
-    """
-    global global_track_counter, local_to_global_id_map, global_track_labels
-    global active_objects_per_camera, cross_camera_candidates
-    
-    # Check if this local track already has a global ID
-    if (camera_id, local_track_id) in local_to_global_id_map:
-        return local_to_global_id_map[(camera_id, local_track_id)]
-    
-    if not label:
-        # If no label, just create a new global ID
-        new_global_id = global_track_counter
-        global_track_counter += 1
-        local_to_global_id_map[(camera_id, local_track_id)] = new_global_id
-        return new_global_id
-    
-    # Check for cross-camera matching opportunity
-    other_camera = 1 if camera_id == 0 else 0
-    
-    # Look for objects with the same label on the other camera that aren't matched yet
-    available_matches = []
-    if label in active_objects_per_camera[other_camera]:
-        for other_local_id, other_global_id in active_objects_per_camera[other_camera][label].items():
-            # Check if this global_id is already being used by another object on our camera
-            already_matched_on_this_camera = False
-            for our_local_id, our_global_id in active_objects_per_camera[camera_id][label].items():
-                if our_global_id == other_global_id:
-                    already_matched_on_this_camera = True
-                    break
-            
-            if not already_matched_on_this_camera:
-                available_matches.append((other_local_id, other_global_id))
-    
-    # If we found an available match on the other camera, use its global ID
-    if available_matches:
-        # Use the first available match (you could implement more sophisticated matching here)
-        matched_local_id, matched_global_id = available_matches[0]
-        local_to_global_id_map[(camera_id, local_track_id)] = matched_global_id
-        active_objects_per_camera[camera_id][label][local_track_id] = matched_global_id
-        global_track_labels[matched_global_id] = label
-        return matched_global_id
-    
-    # No cross-camera match found, create a new global ID
-    new_global_id = global_track_counter
-    global_track_counter += 1
-    local_to_global_id_map[(camera_id, local_track_id)] = new_global_id
-    active_objects_per_camera[camera_id][label][local_track_id] = new_global_id
-    global_track_labels[new_global_id] = label
-    
-    return new_global_id
-
-def cleanup_inactive_tracks(camera_id, active_local_track_ids):
-    """
-    Clean up tracking data for tracks that are no longer active
-    
-    Args:
-        camera_id: ID of the camera
-        active_local_track_ids: Set of currently active local track IDs
-    """
-    global local_to_global_id_map, active_objects_per_camera
-    
-    # Find inactive tracks for this camera
-    inactive_tracks = []
-    for (cam_id, local_id), global_id in local_to_global_id_map.items():
-        if cam_id == camera_id and local_id not in active_local_track_ids:
-            inactive_tracks.append((cam_id, local_id, global_id))
-    
-    # Remove inactive tracks
-    for cam_id, local_id, global_id in inactive_tracks:
-        # Remove from local_to_global_id_map
-        del local_to_global_id_map[(cam_id, local_id)]
-        
-        # Remove from active_objects_per_camera
-        label = global_track_labels.get(global_id)
-        if label and label in active_objects_per_camera[cam_id]:
-            if local_id in active_objects_per_camera[cam_id][label]:
-                del active_objects_per_camera[cam_id][label][local_id]
-                
-                # Clean up empty label entries
-                if not active_objects_per_camera[cam_id][label]:
-                    del active_objects_per_camera[cam_id][label]
-
-def analyze_movement_direction(track_id, center, tracking_data, camera_id, global_id):
-    """
-    Analyze movement direction based on 5 consecutive frames using global IDs
-    Args:
-        track_id: The local ID of the tracked object
+        track_id: The ID of the tracked object
         center: Current center point (x, y)
         tracking_data: TrackingData instance containing counted_tracks
-        camera_id: ID of the camera (0 or 1)
-        global_id: Global ID for this track
-    Returns: 'entry' for upward movement, 'exit' for downward movement, None for undefined
-    """
-    # Store movement in camera-specific history
-    camera_movement_history[camera_id][track_id].appendleft(center)
-    
-    # Copy to global movement history (to maintain analysis consistency)
-    global_movement_history[global_id].appendleft((center, camera_id))
-    
-    # Wait until we have enough frames to analyze for this camera
-    if len(camera_movement_history[camera_id][track_id]) < 5:
-        return None
+        current_bbox: Current bounding box (x1, y1, x2, y2)
         
-    # Calculate vertical movement
-    first_y = camera_movement_history[camera_id][track_id][-1][1]  # Oldest position
-    last_y = camera_movement_history[camera_id][track_id][0][1]    # Newest position
+    Returns: 
+        'entry' for upward movement, 'exit' for downward movement, None for undefined
+    """
+    # Add current position to history
+    movement_history[track_id].appendleft(center)
     
+    # Track bounding box area
+    bbox_area = (current_bbox[2] - current_bbox[0]) * (current_bbox[3] - current_bbox[1])
+    bbox_area_history[track_id].appendleft(bbox_area)
+
+    # Wait until we have enough frames to analyze
+    if len(movement_history[track_id]) < 3:
+        return None
+
+    # ===== CHECK 1: Bounding Box Stability =====
+    # Reject if bounding box size is changing too much (hand obscuring object)
+    if len(bbox_area_history[track_id]) >= 5:
+        areas = list(bbox_area_history[track_id])
+        avg_area = sum(areas) / len(areas)
+        area_variance = sum((a - avg_area) ** 2 for a in areas) / len(areas)
+        area_std_dev = area_variance ** 0.5
+        
+        # If area varies more than 80% of average, bounding box is unstable
+        if area_std_dev > (avg_area * 0.8):
+            return None  # Likely hand is moving/obscuring, not actual object movement
+
+    # ===== CHECK 2: Total Displacement =====
+    # Object must actually move a significant distance
+    first_y = movement_history[track_id][-1][1]  # Oldest position
+    last_y = movement_history[track_id][0][1]    # Newest position
+    total_displacement = abs(last_y - first_y)
+    
+    # Require at least 50 pixels total movement over 5 frames
+    DISPLACEMENT_THRESHOLD = 50
+    if total_displacement < DISPLACEMENT_THRESHOLD:
+        return None  # Not enough movement, likely just jittering
+
+    # ===== CHECK 3: Movement Consistency =====
+    # Ensure movement is consistently in one direction (not oscillating)
+    movement_directions = []
+    for i in range(1, len(movement_history[track_id])):
+        curr_y = movement_history[track_id][i-1][1]
+        prev_y = movement_history[track_id][i][1]
+        movement_directions.append(1 if curr_y > prev_y else -1)
+    
+    # Count movements in each direction
+    positive_movements = sum(1 for d in movement_directions if d > 0)
+    negative_movements = sum(1 for d in movement_directions if d < 0)
+    consistency_ratio = max(positive_movements, negative_movements) / len(movement_directions)
+    
+    # Require 70% of movements in the same direction
+    if consistency_ratio < 0.7:
+        return None  # Movement too erratic (up-down-up-down)
+
+    # ===== CHECK 4: Average Movement Threshold =====
     # Calculate average movement between consecutive points
     total_movement = 0
-    for i in range(1, len(camera_movement_history[camera_id][track_id])):
-        curr_y = camera_movement_history[camera_id][track_id][i-1][1]
-        prev_y = camera_movement_history[camera_id][track_id][i][1]
+    for i in range(1, len(movement_history[track_id])):
+        curr_y = movement_history[track_id][i-1][1]
+        prev_y = movement_history[track_id][i][1]
         total_movement += curr_y - prev_y
-    
+
     avg_movement = total_movement / 4  # We have 4 intervals between 5 points
-    
-    # Use a threshold to determine significant movement (e.g., 5 pixels)
-    threshold = 5
-    
-    if abs(avg_movement) < threshold:
+
+    # Use a threshold to determine significant movement per frame
+    FRAME_MOVEMENT_THRESHOLD = 1
+    if abs(avg_movement) < FRAME_MOVEMENT_THRESHOLD:
         return None
-    
-    # Determine current direction
+
+    # ===== Determine Direction =====
     current_direction = 'exit' if avg_movement > 0 else 'entry'
-    
-    # Check if direction has changed since last count for this global ID
-    if global_id in global_last_counted_direction:
-        if current_direction != global_last_counted_direction[global_id]:
-            # Direction changed, remove global_id from the old direction's counted set
-            if global_last_counted_direction[global_id] in tracking_data.counted_tracks:
-                tracking_data.counted_tracks[global_last_counted_direction[global_id]].discard(global_id)
-    
-    # Update global movement direction and last counted direction
-    global_last_counted_direction[global_id] = current_direction
-        
+
+    # ===== Handle Direction Changes =====
+    # If object changes direction, remove from old direction's counted set
+    if track_id in last_counted_direction:
+        if current_direction != last_counted_direction[track_id]:
+            # Direction changed, remove track_id from the old direction's counted set
+            if last_counted_direction[track_id] in tracking_data.counted_tracks:
+                tracking_data.counted_tracks[last_counted_direction[track_id]].discard(track_id)
+
+    # ===== Update Tracking State =====
+    movement_direction[track_id] = current_direction
+    last_counted_direction[track_id] = current_direction
+
     return current_direction
 
+
+import time
+import cv2
+import numpy as np
+
+class EnhancedTracker:
+    def __init__(self, max_age=3, min_hits=2, iou_threshold=0.3, max_disappeared=30):
+        self.max_age = max_age
+        self.min_hits = min_hits
+        self.iou_threshold = iou_threshold
+        self.max_disappeared = max_disappeared  # Max frames to keep lost tracks
+        self.track_id_count = 0
+        self.tracks = {}  # Active tracks
+        self.lost_tracks = {}  # Recently lost tracks that can be recovered
+        self.history_length = 10
+        self.velocity_history = {}
+        self.occlusion_candidates = {}
+        self.label_track_history = {}  # Map label to list of track IDs
+
+    def _get_center(self, bbox):
+        """Calculate center point of bbox"""
+        x1, y1, x2, y2 = bbox
+        return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+    def _calculate_distance(self, point1, point2):
+        """Calculate Euclidean distance between two points"""
+        x1, y1 = point1
+        x2, y2 = point2
+        return ((x1 - x2) ** 2 + (y1 - y2) ** 2) ** 0.5
+
+    def _calculate_iou(self, bbox1, bbox2):
+        """Calculate IoU between two bounding boxes"""
+        x1 = max(bbox1[0], bbox2[0])
+        y1 = max(bbox1[1], bbox2[1])
+        x2 = min(bbox1[2], bbox2[2])
+        y2 = min(bbox1[3], bbox2[3])
+        
+        if x2 < x1 or y2 < y1:
+            return 0.0
+            
+        intersection = (x2 - x1) * (y2 - y1)
+        bbox1_area = (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1])
+        bbox2_area = (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1])
+        union = bbox1_area + bbox2_area - intersection
+        
+        return intersection / union if union > 0 else 0
+            
+    def _calculate_velocity(self, track_id):
+        """Calculate object velocity based on recent positions"""
+        if track_id not in self.velocity_history or len(self.velocity_history[track_id]) < 2:
+            return None
+            
+        recent_positions = self.velocity_history[track_id][-2:]
+        time_diff = recent_positions[1]['time'] - recent_positions[0]['time']
+        if time_diff == 0:
+            return None
+            
+        dx = recent_positions[1]['center'][0] - recent_positions[0]['center'][0]
+        dy = recent_positions[1]['center'][1] - recent_positions[0]['center'][1]
+        
+        return dx/time_diff, dy/time_diff
+
+    def _predict_next_position(self, track_id):
+        """Predict next position based on velocity"""
+        velocity = self._calculate_velocity(track_id)
+        if not velocity or track_id not in self.velocity_history:
+            return None
+            
+        last_pos = self.velocity_history[track_id][-1]
+        dt = time.time() - last_pos['time']
+        
+        pred_x = last_pos['center'][0] + velocity[0] * dt
+        pred_y = last_pos['center'][1] + velocity[1] * dt
+        
+        return (pred_x, pred_y)
+
+    def _try_recover_lost_track(self, detection):
+        """Try to match detection with a recently lost track of same label"""
+        label = detection['label']
+        det_center = self._get_center(detection['bbox'])
+        
+        best_match = None
+        min_distance = float('inf')
+        best_iou = 0
+        
+        # Look for lost tracks with same label
+        for track_id, track_data in list(self.lost_tracks.items()):
+            if track_data['label'] != label:
+                continue
+            
+            # Check if lost track hasn't been gone too long
+            if track_data['disappeared_frames'] > self.max_disappeared:
+                continue
+            
+            # Calculate distance from last known position
+            last_center = self._get_center(track_data['bbox'])
+            distance = self._calculate_distance(det_center, last_center)
+            
+            # Also check IoU
+            iou = self._calculate_iou(track_data['bbox'], detection['bbox'])
+            
+            # Use combination of distance and IoU for matching
+            # Prioritize close matches or high IoU
+            if (distance < 9999999 or iou > 0.1) and (distance < min_distance or iou > best_iou):
+                min_distance = distance
+                best_iou = iou
+                best_match = track_id
+        
+        return best_match
+
+    def _handle_occlusions(self, unmatched_tracks, current_detections):
+        """Handle potential occlusions between objects"""
+        for track_id in unmatched_tracks:
+            if track_id not in self.tracks:
+                continue
+                
+            predicted_pos = self._predict_next_position(track_id)
+            if not predicted_pos:
+                continue
+                
+            for det in current_detections:
+                det_center = self._get_center(det['bbox'])
+                distance = self._calculate_distance(predicted_pos, det_center)
+                
+                if distance < 9999999:
+                    if track_id not in self.occlusion_candidates:
+                        self.occlusion_candidates[track_id] = {
+                            'occluding_detection': det,
+                            'start_time': time.time(),
+                            'predicted_position': predicted_pos
+                        }
+                    self.tracks[track_id]['max_age'] = self.max_age * 2
+
+    def _update_track(self, track_id, detection, current_time):
+        """Update track with new detection"""
+        self.tracks[track_id].update({
+            'bbox': detection['bbox'],
+            'class_id': detection['class_id'],
+            'label': detection['label'],
+            'confidence': detection['confidence'],
+            'hits': self.tracks[track_id]['hits'] + 1,
+            'age': 0,
+            'disappeared_frames': 0
+        })
+        
+        center = self._get_center(detection['bbox'])
+        if track_id not in self.velocity_history:
+            self.velocity_history[track_id] = []
+        self.velocity_history[track_id].append({
+            'center': center,
+            'time': current_time
+        })
+        
+        if len(self.velocity_history[track_id]) > self.history_length:
+            self.velocity_history[track_id].pop(0)
+
+    def _move_to_lost_tracks(self, track_id):
+        """Move track to lost_tracks instead of deleting immediately"""
+        if track_id in self.tracks:
+            self.lost_tracks[track_id] = self.tracks[track_id].copy()
+            self.lost_tracks[track_id]['disappeared_frames'] = 0
+            del self.tracks[track_id]
+
+    def _update_track_ages(self, matched_tracks):
+        """Update ages of tracks and move old ones to lost_tracks"""
+        tracks_to_move = []
+        
+        for track_id, track in self.tracks.items():
+            if track_id not in matched_tracks:
+                track['age'] += 1
+                if track_id in self.occlusion_candidates:
+                    if time.time() - self.occlusion_candidates[track_id]['start_time'] > 2.0:
+                        tracks_to_move.append(track_id)
+                elif track['age'] > track['max_age']:
+                    tracks_to_move.append(track_id)
+        
+        # Move tracks to lost_tracks
+        for track_id in tracks_to_move:
+            self._move_to_lost_tracks(track_id)
+            if track_id in self.occlusion_candidates:
+                del self.occlusion_candidates[track_id]
+        
+        # Update lost tracks and remove very old ones
+        lost_to_remove = []
+        for track_id, track_data in self.lost_tracks.items():
+            track_data['disappeared_frames'] += 1
+            if track_data['disappeared_frames'] > self.max_disappeared:
+                lost_to_remove.append(track_id)
+        
+        for track_id in lost_to_remove:
+            del self.lost_tracks[track_id]
+            if track_id in self.velocity_history:
+                del self.velocity_history[track_id]
+
+    def _create_new_track(self, detection, current_time, recovered_id=None):
+        """Create a new track or recover a lost one"""
+        if recovered_id is not None:
+            track_id = recovered_id
+            # Restore from lost tracks
+            if recovered_id in self.lost_tracks:
+                self.tracks[track_id] = self.lost_tracks[recovered_id].copy()
+                self.tracks[track_id]['age'] = 0
+                self.tracks[track_id]['disappeared_frames'] = 0
+                del self.lost_tracks[recovered_id]
+        else:
+            self.track_id_count += 1
+            track_id = self.track_id_count
+            self.tracks[track_id] = {
+                'age': 0,
+                'hits': 1,
+                'max_age': self.max_age,
+                'disappeared_frames': 0
+            }
+        
+        # Update with current detection
+        self.tracks[track_id].update({
+            'bbox': detection['bbox'],
+            'class_id': detection['class_id'],
+            'label': detection['label'],
+            'confidence': detection['confidence']
+        })
+        
+        center = self._get_center(detection['bbox'])
+        if track_id not in self.velocity_history:
+            self.velocity_history[track_id] = []
+        self.velocity_history[track_id].append({
+            'center': center,
+            'time': current_time
+        })
+        
+        # Keep history per label
+        label = detection['label']
+        if label not in self.label_track_history:
+            self.label_track_history[label] = []
+        if track_id not in self.label_track_history[label]:
+            self.label_track_history[label].append(track_id)
+        
+        return track_id
+
+    def update(self, detections):
+        """Update tracks with new detections"""
+        current_time = time.time()
+        
+        if not self.tracks and not self.lost_tracks:
+            for det in detections:
+                self._create_new_track(det, current_time)
+            return [{'id': k, **v} for k, v in self.tracks.items()]
+        
+        matched_tracks = set()
+        matched_detections = set()
+        
+        # First pass: Match with active tracks using predicted positions
+        for track_id, track in self.tracks.items():
+            predicted_pos = self._predict_next_position(track_id)
+            if predicted_pos:
+                for i, det in enumerate(detections):
+                    if i in matched_detections:
+                        continue
+                    
+                    if det['label'] != track['label']:
+                        continue
+                        
+                    det_center = self._get_center(det['bbox'])
+                    distance = self._calculate_distance(predicted_pos, det_center)
+                    
+                    if distance < 9999999:
+                        matched_tracks.add(track_id)
+                        matched_detections.add(i)
+                        self._update_track(track_id, detections[i], current_time)
+                        break
+        
+        # Second pass: IOU matching with active tracks
+        for track_id, track in self.tracks.items():
+            if track_id in matched_tracks:
+                continue
+                
+            max_iou = self.iou_threshold
+            best_match = None
+            
+            for i, det in enumerate(detections):
+                if i in matched_detections or det['label'] != track['label']:
+                    continue
+                    
+                iou = self._calculate_iou(track['bbox'], det['bbox'])
+                if iou > max_iou:
+                    max_iou = iou
+                    best_match = i
+            
+            if best_match is not None:
+                matched_tracks.add(track_id)
+                matched_detections.add(best_match)
+                self._update_track(track_id, detections[best_match], current_time)
+        
+        # Handle occlusions
+        unmatched_tracks = set(self.tracks.keys()) - matched_tracks
+        self._handle_occlusions(unmatched_tracks, detections)
+        
+        # Third pass: Try to recover lost tracks for unmatched detections
+        for i, det in enumerate(detections):
+            if i in matched_detections:
+                continue
+            
+            # Try to find a matching lost track
+            recovered_id = self._try_recover_lost_track(det)
+            
+            if recovered_id is not None:
+                # Recover the lost track
+                self._create_new_track(det, current_time, recovered_id=recovered_id)
+                matched_detections.add(i)
+            else:
+                # Create completely new track
+                self._create_new_track(det, current_time)
+                matched_detections.add(i)
+        
+        # Update track ages and manage lost tracks
+        self._update_track_ages(matched_tracks)
+        
+        # Return active tracks that meet criteria
+        return [{'id': k, **v} for k, v in self.tracks.items() 
+                if v['hits'] >= self.min_hits and v['age'] <= v['max_age']]
+
+    def get_track_info(self):
+        """Get information about all tracks (active and lost)"""
+        return {
+            'active_tracks': len(self.tracks),
+            'lost_tracks': len(self.lost_tracks),
+            'total_tracks_created': self.track_id_count,
+            'tracks_by_label': {
+                label: [tid for tid in track_ids if tid in self.tracks or tid in self.lost_tracks]
+                for label, track_ids in self.label_track_history.items()
+            }
+        }
+
+
+# Initialize tracker globally or per stream
+# max_disappeared: frames to keep lost tracks before permanent deletion
+tracker = EnhancedTracker(max_age=1, min_hits=2, iou_threshold=0.3, max_disappeared=9999999)
+
+
 def detection_callback(pad, info, callback_data):
-    global camera_covered, cover_alert_thread, blink
+    global camera_covered, cover_alert_thread, tracker
     user_data = callback_data["user_data"]
     stream_id = callback_data["stream_id"]
     buffer = info.get_buffer()
@@ -1786,77 +2073,89 @@ def detection_callback(pad, info, callback_data):
     if not all([format, width, height]):
         return Gst.PadProbeReturn.OK
 
-    # Process detections first
-    roi = hailo.get_roi_from_buffer(buffer)
-    detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
-    
-    # Get video frame for visualization
+    # Get video frame
     frame = get_numpy_from_buffer(buffer, format, width, height)
     
     # Check if frame is dark/covered
     if is_frame_dark(frame):
-        camera_covered = True
-        if cover_alert_thread is None or not cover_alert_thread.is_alive():
-            cover_alert_thread = threading.Thread(target=handle_cover_alert, daemon=True)
-            cover_alert_thread.start()
+        if not camera_covered:  # Only start thread if not already covered
+            camera_covered = True
+            if cover_alert_thread is None or not cover_alert_thread.is_alive():
+                cover_alert_thread = threading.Thread(target=handle_cover_alert, daemon=True)
+                cover_alert_thread.start()
     else:
-        camera_covered = False
-        GPIO.output(BUZZER_PIN, GPIO.HIGH)  # Ensure buzzer is off when camera is not covered
+        if camera_covered:  # Only log when transitioning from covered to uncovered
+            camera_covered = False
 
-    # Collect active track IDs for cleanup
-    active_local_track_ids = set()
+    # Get detections from Hailo
+    roi = hailo.get_roi_from_buffer(buffer)
+    detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
     
-    # Process detections and draw on frame
+    # Convert Hailo detections to enhanced tracker format
+    tracker_detections = []
     for detection in detections:
         label = detection.get_label()
         bbox = detection.get_bbox()
         confidence = detection.get_confidence()
         class_id = detection.get_class_id()
         
-        # Get track ID from Hailo tracker
-        track_id = 0
-        track = detection.get_objects_typed(hailo.HAILO_UNIQUE_ID)
-        if len(track) == 1:
-            track_id = track[0].get_id()
-            active_local_track_ids.add(track_id)
-        
         # Calculate bounding box coordinates
         x1 = int(bbox.xmin() * width)
         y1 = int(bbox.ymin() * height)
         x2 = int(bbox.xmax() * width)
         y2 = int(bbox.ymax() * height)
+        
+        tracker_detections.append({
+            'bbox': (x1, y1, x2, y2),
+            'label': label,
+            'confidence': confidence,
+            'class_id': class_id
+        })
+    
+    # Update enhanced tracker
+    tracked_objects = tracker.update(tracker_detections)
+    
+    # Process tracked objects
+    for tracked_obj in tracked_objects:
+        track_id = tracked_obj['id']
+        label = tracked_obj['label']
+        confidence = tracked_obj['confidence']
+        class_id = tracked_obj['class_id']
+        x1, y1, x2, y2 = tracked_obj['bbox']
         center = (int((x1 + x2) / 2), int((y1 + y2) / 2))
         
-        # Get or create global track ID
-        global_id = get_global_track_id(stream_id, track_id, None, label)
-        
+        # Validate product
         validation_result = user_data.validate_detected_product(label)
         color = compute_color_for_labels(class_id)
         
-        # Draw bounding box and label with track ID
+        # Draw bounding box and label
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        label_text = f"{label} L:{track_id} G:{global_id} {'Valid' if validation_result['valid'] else 'Invalid'}"
+        label_text = f"{label} ID:{track_id} {'Valid' if validation_result['valid'] else 'Invalid'}"
         cv2.putText(frame, label_text, (x1, y1 - 10),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                     (0, 255, 0) if validation_result['valid'] else (0, 0, 255), 2)
         
         # Draw trail
-        draw_trail(frame, track_id, center, color, global_id=global_id)
+        draw_trail(frame, track_id, center, color)
         
-        # Analyze movement direction and update counters
-        direction = analyze_movement_direction(track_id, center, user_data.tracking_data, stream_id, global_id)
+        # Pass bounding box to movement analysis
+        direction = analyze_movement_direction(
+            track_id, 
+            center, 
+            user_data.tracking_data,
+            (x1, y1, x2, y2)  # Add this parameter
+        )
         
         if direction:
-            # Only increment counter if we haven't counted this global_id's movement yet
-            # or if the direction has changed since last count
-            if (global_id not in user_data.tracking_data.counted_tracks.get(direction, set()) or
-                (global_id in global_last_counted_direction and 
-                 direction != global_last_counted_direction[global_id])):
+            # Check if not already counted
+            if (track_id not in user_data.tracking_data.counted_tracks.get(direction, set()) or
+                (track_id in last_counted_direction and 
+                 direction != last_counted_direction[track_id])):
                      
                 user_data.tracking_data.class_counters[direction][label] += 1
                 if direction not in user_data.tracking_data.counted_tracks:
                     user_data.tracking_data.counted_tracks[direction] = set()
-                user_data.tracking_data.counted_tracks[direction].add(global_id)
+                user_data.tracking_data.counted_tracks[direction].add(track_id)
                 
                 # Update validated/invalidated products
                 if validation_result['valid']:
@@ -1873,7 +2172,7 @@ def detection_callback(pad, info, callback_data):
                             "raw_detection": {
                                 "name": label,
                                 "confidence": confidence,
-                                "tracking_id": global_id,
+                                "tracking_id": track_id,
                                 "bounding_box": {
                                     "xmin": x1,
                                     "ymin": y1,
@@ -1884,26 +2183,27 @@ def detection_callback(pad, info, callback_data):
                         }
                     user_data.tracking_data.invalidated_products[direction][label]["count"] += 1
 
-    # Clean up inactive tracks for this camera
-    cleanup_inactive_tracks(stream_id, active_local_track_ids)
-
-    # Draw FPS and other overlays
+    # Draw counts
     current_time = time.time()
     user_data.tracking_data.last_time = current_time
     
-    # Draw counts
-    label = next((det.get_label() for det in detections), None)
+    label = tracked_objects[0]['label'] if tracked_objects else None
     draw_counts(frame, user_data.tracking_data.class_counters, label)
+    
+    # Optional: Display tracker info for debugging
+    # track_info = tracker.get_track_info()
+    # cv2.putText(frame, f"Active: {track_info['active_tracks']} Lost: {track_info['lost_tracks']}", 
+    #             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     
     frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-    # Store frames in user_data
+    # Store frames
     if stream_id == 0:
         user_data.frame_left = frame
+        user_data.set_frame(frame)
     elif stream_id == 1:
         user_data.frame_right = frame
         
-    # Check if both frames are available
     if hasattr(user_data, "frame_left") and hasattr(user_data, "frame_right"):
         combined_frame = np.hstack((user_data.frame_left, user_data.frame_right))
         user_data.set_frame(combined_frame)
@@ -1945,13 +2245,12 @@ def detection_callback(pad, info, callback_data):
     # Calculate prices and control buzzer
     current_data = user_data.tracking_data.websocket_data_manager.get_current_data()
     deposit = user_data.deposit
-    total_price = calculate_total_price_and_control_buzzer(current_data, deposit)
+    total_price = calculate_total_price_and_control_buzzer(current_data, deposit, label)
     
     return Gst.PadProbeReturn.OK
-                
-                
+
 async def run_tracking(websocket: WebSocket):
-    global readyToProcess,cover_alert_thread
+    global readyToProcess, cover_alert_thread
     global unlock_data, done
     unlock_data = 0
     deposit = 0.0
@@ -1961,8 +2260,7 @@ async def run_tracking(websocket: WebSocket):
     transaction_id = None
     product_name = None
     image_count = None
-    #time.sleep(0.5)
-    #GPIO.output(DOOR_LOCK_PIN, GPIO.HIGH)
+    
     # Wait for start_preview message
     while True:
         try:
@@ -1979,7 +2277,6 @@ async def run_tracking(websocket: WebSocket):
                     transaction_id = message.get('transaction_id')
                     product_name = message.get('product_name')
                     image_count = message.get('image_count')
-                    
                     
                     print(f"Deposit: {deposit}")
                     print(f"Machine ID: {machine_id}")
@@ -2006,25 +2303,19 @@ async def run_tracking(websocket: WebSocket):
     # Handle door control
     if unlock_data == 1:   
         print("Unlock door for 0.5 seconds")
-        #GPIO.output(DOOR_LOCK_PIN, GPIO.LOW)
-        readyToProcess= True
+        readyToProcess = True
         unlock_data = 0
         print("Unlock data reset to 0")
 
-
-    
-    
     try:
         if isinstance(message, dict) and message.get('action') == 'product_upload':
-                    
             done = True        
             machine_id = message.get('machine_id')
             machine_identifier = message.get('machine_identifier')
             user_id = message.get('user_id')
             product_name = message.get('product_name')
             image_count = message.get('image_count')
-                
-                   
+            
             print(f"Machine ID: {machine_id}")
             print(f"Machine Identifier: {machine_identifier}")
             print(f"User ID: {user_id}")
@@ -2036,43 +2327,44 @@ async def run_tracking(websocket: WebSocket):
             print("="*50)
             print(f"Total images to capture: {image_count * 2} ({image_count} per camera)")
             
+            # Get alert sound paths
+            alert_dir = "sounds/product_upload_alerts"
             
-            GPIO.output(BUZZER_PIN, GPIO.LOW)
-            time.sleep(3)
-            GPIO.output(BUZZER_PIN, GPIO.HIGH)
-            
+            # Play start capture alert
+            tts_manager.play_mp3_sync(f"{alert_dir}/start_capture.mp3", volume=0.8)
             time.sleep(2)
             
             # Capture from camera1 (/dev/video0) FIRST
             print("\n" + "-"*30)
             print("CAMERA 1 CAPTURE PHASE")
             print("-"*30)
-            camera1_images = capture_images(0, image_count)  # or capture_images_interactive(0, image_count)
-            
+            camera1_images = capture_images(0, image_count)
             
             # Small break between cameras
             print("\n" + "="*20)
             print("SWITCHING TO CAMERA 2")
             print("="*20)
             
-            GPIO.output(BUZZER_PIN, GPIO.LOW)
-            time.sleep(3)
-            GPIO.output(BUZZER_PIN, GPIO.HIGH)
-            
+            # Play camera switch alert
+            tts_manager.play_mp3_sync(f"{alert_dir}/camera_switch.mp3", volume=0.8)
             time.sleep(2)
         
             # Capture from camera2 (/dev/video2) SECOND
             print("\n" + "-"*30)
             print("CAMERA 2 CAPTURE PHASE")
             print("-"*30)
-            camera2_images = capture_images(2, image_count)  # or capture_images_interactive(2, image_count)
+            camera2_images = capture_images(2, image_count)
         
             if camera1_images and camera2_images:
                 print("\nAll images captured successfully!")
+                
+                # Play completion alert
+                tts_manager.play_mp3_sync(f"{alert_dir}/all_complete.mp3", volume=0.8)
             
                 # Upload images to API
                 print("\nUploading images to API...")
-                if upload_images_to_api(camera1_images, camera2_images,machine_id,machine_identifier, user_id, product_name, image_count):
+                if upload_images_to_api(camera1_images, camera2_images, machine_id, 
+                                       machine_identifier, user_id, product_name, image_count):
                     print("Images uploaded successfully!")
                     
                     # Delete all captured images after successful upload
@@ -2080,21 +2372,25 @@ async def run_tracking(websocket: WebSocket):
                     all_images = camera1_images + camera2_images
                     delete_images(all_images)
                     
-                    # Sound buzzer to indicate success
-                    GPIO.output(BUZZER_PIN, GPIO.LOW)
-                    time.sleep(3)
-                    GPIO.output(BUZZER_PIN, GPIO.HIGH)
+                    # Play success alert
+                    tts_manager.play_mp3_sync(f"{alert_dir}/upload_success.mp3", volume=0.8)
                 else:
                     print("Failed to upload images.")
-                    print("Images will be kept for retry or manual inspection.") 
+                    print("Images will be kept for retry or manual inspection.")
+                    
+                    # Play failure alert
+                    tts_manager.play_mp3_sync(f"{alert_dir}/upload_failed.mp3", volume=0.8)
                     
             else:
-                print("Failed to capture all images.")      
+                print("Failed to capture all images.")
+                # Play failure alert
+                tts_manager.play_mp3_sync(f"{alert_dir}/upload_failed.mp3", volume=0.8)
                    
         else:
             # Initialize door status monitoring
             door_monitor_active = True
             done = True
+            
             async def monitor_door():
                 nonlocal door_monitor_active
                 while door_monitor_active:
@@ -2114,22 +2410,18 @@ async def run_tracking(websocket: WebSocket):
                            print(f"Error sending final message: {e}")
                         break
                     await asyncio.sleep(0.1)
+            
             # Start door monitoring task
             door_monitor_task = asyncio.create_task(monitor_door())
     
             # Initialize Hailo detection
-            callback = HailoDetectionCallback(websocket,deposit,machine_id, machine_identifier, user_id, transaction_id)
+            callback = HailoDetectionCallback(websocket, deposit, machine_id, 
+                                             machine_identifier, user_id, transaction_id)
     
             def send_websocket_data():
                 while not callback.tracking_data.shutdown_event.is_set():
                     try:
                         current_data = callback.tracking_data.websocket_data_manager.get_current_data()
-                        # Get deposit from user_data (you'll need to add this to your data structure)
-                
-    
-                        # Calculate prices and control buzzer
-                        #total_price = calculate_total_price_and_control_buzzer(current_data, deposit)
-                        #print(f"SINI WEY: {current_data}")
                         asyncio.run(websocket.send_json(current_data))
                         time.sleep(1)  # Send updates every second
                     except Exception as e:
@@ -2138,7 +2430,6 @@ async def run_tracking(websocket: WebSocket):
             # Start websocket data sender thread
             websocket_sender = threading.Thread(target=send_websocket_data)
             websocket_sender.start()
-    
     
             def signal_handler(signum, frame):
                  print("\nCtrl+C detected. Initiating shutdown...")
@@ -2150,40 +2441,79 @@ async def run_tracking(websocket: WebSocket):
             # Set up signal handler
             signal.signal(signal.SIGINT, signal_handler)
 
-    
-
             app = HailoDetectionApp(detection_callback, callback)            
             app.run()
+            
     except Exception as e:
         print(f"Error during tracking: {e}")
     finally:
         # Ensure cleanup happens
-            await websocket.send_json({
-                "status": "stopped",
-                "message": "Tracking has been fullyyy stopped"
-            })
-            door_monitor_active = False
-            if cover_alert_thread is not None and cover_alert_thread.is_alive():
-              camera_covered = False
-              GPIO.output(BUZZER_PIN, GPIO.HIGH)  # Ensure buzzer is off
-              cover_alert_thread.join()
-              cover_alert_thread = None
-              alert_thread.join()
-              alert_thread = None
-            await door_monitor_task
-            callback.tracking_data.shutdown_event.set()
-            callback.shutdown_event.set()
-            websocket_sender.join()
-            app.pipeline.set_state(Gst.State.NULL)
-            cv2.destroyAllWindows()
+        await websocket.send_json({
+            "status": "stopped",
+            "message": "Tracking has been fully stopped"
+        })
+        door_monitor_active = False
+        if cover_alert_thread is not None and cover_alert_thread.is_alive():
+            camera_covered = False
+            tts_manager.stop_all_audio()  # Stop any alert sounds
+            cover_alert_thread.join()
+            cover_alert_thread = None
+            alert_thread.join()
+            alert_thread = None
+        await door_monitor_task
+        callback.tracking_data.shutdown_event.set()
+        callback.shutdown_event.set()
+        websocket_sender.join()
+        app.pipeline.set_state(Gst.State.NULL)
+        cv2.destroyAllWindows()                
+                
+
             
 
-
-
+def setup_product_upload_alerts():
+    """Generate and save product upload alert sounds using TTS"""
+    alert_dir = "sounds/product_upload_alerts"
+    
+    # Create directory if it doesn't exist
+    os.makedirs(alert_dir, exist_ok=True)
+    
+    alerts = {
+        "start_capture": "Get ready to capture images. Please prepare your products.",
+        "camera_switch": "Switching to the next camera. Please wait.",
+        "capture_ready": "Position your product now. Image will be captured shortly.",
+        "image_captured": "Image captured successfully.",
+        "next_position": "Next position.",
+        "upload_success": "All images uploaded successfully. Thank you.",
+        "upload_failed": "Upload failed. Please contact support.",
+        "all_complete": "Image capture completed. Processing your upload."
+    }
+    
+    generated_files = {}
+    
+    for alert_name, alert_text in alerts.items():
+        alert_file = os.path.join(alert_dir, f"{alert_name}.mp3")
+        
+        # Generate the alert message if it doesn't exist
+        if not os.path.exists(alert_file):
+            tts = gTTS(text=alert_text, lang='en', slow=False)
+            tts.save(alert_file)
+            print(f"Generated: {alert_file}")
+        
+        generated_files[alert_name] = alert_file
+    
+    print(f"All product upload alert sounds ready in {alert_dir}")
+    return generated_files
 
 def capture_images(device_id, num_images=3):
-    """Optimized camera capture with faster settings."""
+    """Optimized camera capture with TTS alerts instead of buzzer."""
     image_paths = []
+    
+    # Get alert sound paths
+    alert_dir = "sounds/product_upload_alerts"
+    
+    # Create camera_images directory if it doesn't exist
+    os.makedirs('camera_images', exist_ok=True)
+    
     try:
         # Open the camera
         cap = cv2.VideoCapture(device_id)
@@ -2199,9 +2529,6 @@ def capture_images(device_id, num_images=3):
         cap.set(cv2.CAP_PROP_FPS, 30)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         
-        # OPTIMIZATION 4: Disable auto-exposure for consistent timing (optional)
-        # cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # Manual exposure
-        
         if not cap.isOpened():
             print(f"Error: Could not open camera {device_id}")
             return []
@@ -2209,16 +2536,16 @@ def capture_images(device_id, num_images=3):
         print(f"\n=== Starting capture for Camera {device_id} ===")
         print("Get ready to show your products!")
         
-        
+        # Play capture ready alert
+        tts_manager.play_mp3_sync(f"{alert_dir}/capture_ready.mp3", volume=0.8)
         
         # Capture images
         for i in range(1, num_images + 1):
             print(f"\nCamera {device_id}: Product position {i} now!")
             
-            
             time.sleep(0.5)  
             
-            
+            # Clear buffer
             for _ in range(5):  
                 cap.read()
             
@@ -2237,19 +2564,15 @@ def capture_images(device_id, num_images=3):
             print(f"Saved {filename}")
             image_paths.append(filename)
             
+            # Play image captured confirmation
+            tts_manager.play_mp3_sync(f"{alert_dir}/image_captured.mp3", volume=0.8)
             
-            try:
-                
-                GPIO.output(BUZZER_PIN, GPIO.LOW)
-                time.sleep(1)  # Shorter buzzer time
-                GPIO.output(BUZZER_PIN, GPIO.HIGH)
-            except:
-                pass  # Skip if no GPIO
-            
-            # Reduced wait time between captures
+            # Wait before next capture
             if i < num_images:
                 print(f"Get ready for product position {i+1}...")
-                time.sleep(1)  # Keep this for user positioning
+                # Play next position alert
+                tts_manager.play_mp3_async(f"{alert_dir}/next_position.mp3", volume=0.8)
+                time.sleep(1)
                 
         print(f"\n=== Finished capturing from Camera {device_id} ===")
         cap.release()
@@ -2260,6 +2583,9 @@ def capture_images(device_id, num_images=3):
         if 'cap' in locals():
             cap.release()
         return []
+
+
+
 
 def upload_images_to_api(camera1_images, camera2_images, machine_id, machine_identifier, user_id, product_name, image_count):
     """Upload images to the API."""
@@ -2350,12 +2676,13 @@ from gtts import gTTS
 import pygame
 import io
 from pathlib import Path
-
+import hashlib
 class TTSManager:
     def __init__(self):
         self.tts_lock = Lock()
         self.audio_lock = Lock()  # Separate lock for general audio playback
         self.init_audio_player()
+        self.deposit_sounds_dir = "sounds/deposits"
     
     def init_audio_player(self):
         """Initialize pygame mixer for audio playback"""
@@ -2493,7 +2820,143 @@ class TTSManager:
         except:
             return -1
     
+    def generate_common_deposit_messages(self):
+        """
+        Pre-generate deposit audio files for common product combinations
+        Call this during initialization to cache frequently used messages
+        """
+        try:
+            print("Pre-generating common deposit messages...")
+            
+            # Add your common product names here
+            common_products = [
+                "100plus",
+                "coconut",
+                "mineral",
+                "water bottle",
+                "energy drink"
+            ]
+            
+            # Generate single product messages
+            for product in common_products:
+                self.generate_deposit_audio_file(product)
+            
+            # Generate some common combinations (optional)
+            common_combinations = [
+                ["coke", "pepsi"],
+                ["sprite", "water bottle"],
+                # Add more common combinations as needed
+            ]
+            
+            for combo in common_combinations:
+                self.generate_deposit_audio_file(combo)
+            
+            print("Common deposit messages generated successfully")
+            
+        except Exception as e:
+            print(f"Error generating common deposit messages: {e}")
+    
+    def generate_deposit_audio_file(self, label):
+        """
+        Generate and save deposit audio file for given label(s)
+        Returns the file path of the generated/cached MP3
+        """
+        try:
+            # Build the text message
+            if isinstance(label, str):
+                text = f"Please return the {label}"
+            elif isinstance(label, (list, tuple)):
+                if len(label) == 0:
+                    return None
+                elif len(label) == 1:
+                    text = f"Please return the {label[0]}"
+                elif len(label) == 2:
+                    text = f"Please return the {label[0]} and {label[1]}"
+                else:
+                    items_text = ", ".join(label[:-1]) + f", and {label[-1]}"
+                    text = f"Please return the {items_text}"
+            else:
+                # Handle comma-separated string
+                if isinstance(label, str) and "," in label:
+                    items = [item.strip() for item in label.split(",")]
+                    return self.generate_deposit_audio_file(items)
+                else:
+                    text = f"Please return the {label}"
+            
+            # Create a unique filename based on the text content
+            text_hash = hashlib.md5(text.encode()).hexdigest()[:12]
+            filename = f"deposit_{text_hash}.mp3"
+            filepath = os.path.join(self.deposit_sounds_dir, filename)
+            
+            # Generate the file if it doesn't exist
+            if not os.path.exists(filepath):
+                print(f"Generating deposit audio: {text}")
+                tts = gTTS(text=text, lang='en', slow=False)
+                tts.save(filepath)
+                print(f"Saved deposit audio to: {filepath}")
+            else:
+                print(f"Using cached deposit audio: {filepath}")
+            
+            return filepath
+            
+        except Exception as e:
+            print(f"Error generating deposit audio file: {e}")
+            return None
+
+    def speak_deposit(self, label):
+        """
+        Speak deposit message in English - handles single item or multiple items
+        Uses pre-generated/cached MP3 files for better performance
+        """
+        try:
+            # Handle comma-separated string first
+            if isinstance(label, str) and "," in label:
+                items = [item.strip() for item in label.split(",")]
+                label = items
+            
+            # Generate or get cached audio file
+            filepath = self.generate_deposit_audio_file(label)
+            
+            if filepath and os.path.exists(filepath):
+                # Play the pre-generated MP3 file
+                self.play_mp3_async(filepath, volume=0.8)
+            else:
+                # Fallback to async TTS if file generation failed
+                print("Falling back to async TTS for deposit message")
+                if isinstance(label, str):
+                    self.speak_async(f"Please return the {label}", lang='en')
+                elif isinstance(label, (list, tuple)):
+                    if len(label) == 1:
+                        self.speak_async(f"Please return the {label[0]}", lang='en')
+                    elif len(label) == 2:
+                        self.speak_async(f"Please return the {label[0]} and {label[1]}", lang='en')
+                    elif len(label) > 2:
+                        items_text = ", ".join(label[:-1]) + f", and {label[-1]}"
+                        self.speak_async(f"Please return the {items_text}", lang='en')
+                        
+        except Exception as e:
+            print(f"Error in speak_deposit: {e}")
+            # Final fallback
+            try:
+                self.speak_async(f"Please return the items", lang='en')
+            except:
+                pass
+    
     # ... [Keep all existing TTS methods] ...
+    def generate_door_audio_files(self):
+        """Pre-generate door open/close audio files"""
+        try:
+            # Generate door open
+            tts_open = gTTS(text="Open the door", lang='en', slow=False)
+            tts_open.save("sounds/door_open.mp3")
+        
+            # Generate door close
+            tts_close = gTTS(text="Door is closing", lang='en', slow=False)
+            tts_close.save("sounds/door_close.mp3")
+        
+            print("Door audio files generated successfully")
+        except Exception as e:
+            print(f"Error generating door audio files: {e}")
     
     def speak_async(self, text, lang='en'):
         """Speak text asynchronously using gTTS with improved error handling"""
@@ -2610,13 +3073,15 @@ class TTSManager:
             print(f"Festival not available. Install with: sudo apt-get install festival")
             print(f"No TTS available. Would speak: {text}")
     
+    
+    
     def speak_door_open(self):
-        """Speak door open message in English"""
-        self.speak_async("Open the door", lang='en')
+        """Speak door open message - using pre-recorded file"""
+        self.play_mp3_sync("sounds/door_open.mp3", volume=0.8)
     
     def speak_door_close(self):
-        """Speak door close message in English"""
-        self.speak_async("Door is closing", lang='en')
+        """Speak door close message - using pre-recorded file"""
+        self.play_mp3_sync("sounds/door_close.mp3", volume=0.8)
     
     def speak_english(self, text):
         """Speak text in English"""
@@ -2772,6 +3237,18 @@ def main():
     
     
     args = parser.parse_args()
+    os.makedirs('camera_images', exist_ok=True)
+    os.makedirs("sounds", exist_ok=True)
+    os.makedirs("sounds/deposits", exist_ok=True)
+    setup_cover_alert_sound()  # For camera cover alerts
+    setup_product_upload_alerts()  # For product upload process
+    # Generate door audio files on startup if they don't exist
+    if not os.path.exists("sounds/door_open.mp3") or not os.path.exists("sounds/door_close.mp3"):
+        print("Generating door audio files...")
+        tts_manager.generate_door_audio_files()
+    
+    # Pre-generate common deposit messages
+    tts_manager.generate_common_deposit_messages()
     
     atexit.register(GPIO.cleanup)
     
