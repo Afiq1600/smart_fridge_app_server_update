@@ -2864,24 +2864,24 @@ class TTSManager:
         try:
             # Build the text message
             if isinstance(label, str):
-                text = f"Please return the {label}"
+                text = f"Deposit exceeded. Please return the {label} immediately"
             elif isinstance(label, (list, tuple)):
                 if len(label) == 0:
                     return None
                 elif len(label) == 1:
-                    text = f"Please return the {label[0]}"
+                    text = f"Deposit exceeded. Please return the {label[0]} immediately"
                 elif len(label) == 2:
-                    text = f"Please return the {label[0]} and {label[1]}"
+                    text = f"Deposit exceeded. Please return the {label[0]} and {label[1]} immediately"
                 else:
                     items_text = ", ".join(label[:-1]) + f", and {label[-1]}"
-                    text = f"Please return the {items_text}"
+                    text = f"Deposit exceeded. Please return the {items_text} immediately"
             else:
                 # Handle comma-separated string
                 if isinstance(label, str) and "," in label:
                     items = [item.strip() for item in label.split(",")]
                     return self.generate_deposit_audio_file(items)
                 else:
-                    text = f"Please return the {label}"
+                    text = f"Deposit exceeded. Please return the {label} immediately"
             
             # Create a unique filename based on the text content
             text_hash = hashlib.md5(text.encode()).hexdigest()[:12]
@@ -2924,21 +2924,21 @@ class TTSManager:
                 # Fallback to async TTS if file generation failed
                 print("Falling back to async TTS for deposit message")
                 if isinstance(label, str):
-                    self.speak_async(f"Please return the {label}", lang='en')
+                    self.speak_async(f"Deposit exceeded. Please return the {label} immediately", lang='en')
                 elif isinstance(label, (list, tuple)):
                     if len(label) == 1:
-                        self.speak_async(f"Please return the {label[0]}", lang='en')
+                        self.speak_async(f"Deposit exceeded. Please return the {label[0]} immediately", lang='en')
                     elif len(label) == 2:
-                        self.speak_async(f"Please return the {label[0]} and {label[1]}", lang='en')
+                        self.speak_async(f"Deposit exceeded. Please return the {label[0]} and {label[1]} immediately", lang='en')
                     elif len(label) > 2:
                         items_text = ", ".join(label[:-1]) + f", and {label[-1]}"
-                        self.speak_async(f"Please return the {items_text}", lang='en')
+                        self.speak_async(f"Deposit exceeded. Please return the {items_text} immediately", lang='en')
                         
         except Exception as e:
             print(f"Error in speak_deposit: {e}")
             # Final fallback
             try:
-                self.speak_async(f"Please return the items", lang='en')
+                self.speak_async(f"Deposit exceeded. Please return the items immediately", lang='en')
             except:
                 pass
     
