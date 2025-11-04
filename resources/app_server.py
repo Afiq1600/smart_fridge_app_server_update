@@ -2058,7 +2058,7 @@ class EnhancedTracker:
 
 # Initialize tracker globally or per stream
 # max_disappeared: frames to keep lost tracks before permanent deletion
-tracker = EnhancedTracker(max_age=3, min_hits=2, iou_threshold=0.3, max_disappeared=30)
+tracker = EnhancedTracker(max_age=1, min_hits=1, iou_threshold=0.3, max_disappeared=30)
 
 
 
