@@ -1728,15 +1728,18 @@ import cv2
 import numpy as np
 
 class EnhancedTracker:
-    def __init__(self, max_age=3, min_hits=2, iou_threshold=0.3):
-        self.max_age = max_age  # Increased to allow for temporary disappearances
+    def __init__(self, max_age=3, min_hits=2, iou_threshold=0.3, max_disappeared=30):
+        self.max_age = max_age
         self.min_hits = min_hits
         self.iou_threshold = iou_threshold
+        self.max_disappeared = max_disappeared  # Max frames to keep lost tracks
         self.track_id_count = 0
-        self.tracks = {}
-        self.history_length = 10  # Track more history points
-        self.velocity_history = {}  # Store velocity information
-        self.occlusion_candidates = {}  # Track potentially occluded objects
+        self.tracks = {}  # Active tracks
+        self.lost_tracks = {}  # Recently lost tracks that can be recovered
+        self.history_length = 10
+        self.velocity_history = {}
+        self.occlusion_candidates = {}
+        self.label_track_history = {}  # Map label to list of track IDs
 
     def _get_center(self, bbox):
         """Calculate center point of bbox"""
@@ -1795,6 +1798,40 @@ class EnhancedTracker:
         
         return (pred_x, pred_y)
 
+    def _try_recover_lost_track(self, detection):
+        """Try to match detection with a recently lost track of same label"""
+        label = detection['label']
+        det_center = self._get_center(detection['bbox'])
+        
+        best_match = None
+        min_distance = float('inf')
+        best_iou = 0
+        
+        # Look for lost tracks with same label
+        for track_id, track_data in list(self.lost_tracks.items()):
+            if track_data['label'] != label:
+                continue
+            
+            # Check if lost track hasn't been gone too long
+            if track_data['disappeared_frames'] > self.max_disappeared:
+                continue
+            
+            # Calculate distance from last known position
+            last_center = self._get_center(track_data['bbox'])
+            distance = self._calculate_distance(det_center, last_center)
+            
+            # Also check IoU
+            iou = self._calculate_iou(track_data['bbox'], detection['bbox'])
+            
+            # Use combination of distance and IoU for matching
+            # Prioritize close matches or high IoU
+            if (distance < 200 or iou > 0.1) and (distance < min_distance or iou > best_iou):
+                min_distance = distance
+                best_iou = iou
+                best_match = track_id
+        
+        return best_match
+
     def _handle_occlusions(self, unmatched_tracks, current_detections):
         """Handle potential occlusions between objects"""
         for track_id in unmatched_tracks:
@@ -1805,20 +1842,17 @@ class EnhancedTracker:
             if not predicted_pos:
                 continue
                 
-            # Check if track might be occluded by any current detection
             for det in current_detections:
                 det_center = self._get_center(det['bbox'])
                 distance = self._calculate_distance(predicted_pos, det_center)
                 
-                # If predicted position is very close to a detection
-                if distance < 50:  # Threshold in pixels
+                if distance < 50:
                     if track_id not in self.occlusion_candidates:
                         self.occlusion_candidates[track_id] = {
                             'occluding_detection': det,
                             'start_time': time.time(),
                             'predicted_position': predicted_pos
                         }
-                    # Extend track's max age while it might be occluded
                     self.tracks[track_id]['max_age'] = self.max_age * 2
 
     def _update_track(self, track_id, detection, current_time):
@@ -1829,10 +1863,10 @@ class EnhancedTracker:
             'label': detection['label'],
             'confidence': detection['confidence'],
             'hits': self.tracks[track_id]['hits'] + 1,
-            'age': 0
+            'age': 0,
+            'disappeared_frames': 0
         })
         
-        # Update velocity history
         center = self._get_center(detection['bbox'])
         if track_id not in self.velocity_history:
             self.velocity_history[track_id] = []
@@ -1841,59 +1875,105 @@ class EnhancedTracker:
             'time': current_time
         })
         
-        # Keep only recent history
         if len(self.velocity_history[track_id]) > self.history_length:
             self.velocity_history[track_id].pop(0)
 
+    def _move_to_lost_tracks(self, track_id):
+        """Move track to lost_tracks instead of deleting immediately"""
+        if track_id in self.tracks:
+            self.lost_tracks[track_id] = self.tracks[track_id].copy()
+            self.lost_tracks[track_id]['disappeared_frames'] = 0
+            del self.tracks[track_id]
+
     def _update_track_ages(self, matched_tracks):
-        """Update ages of tracks and remove old ones"""
-        tracks_to_remove = []
+        """Update ages of tracks and move old ones to lost_tracks"""
+        tracks_to_move = []
+        
         for track_id, track in self.tracks.items():
             if track_id not in matched_tracks:
                 track['age'] += 1
                 if track_id in self.occlusion_candidates:
-                    # Check if occlusion has lasted too long
                     if time.time() - self.occlusion_candidates[track_id]['start_time'] > 2.0:
-                        tracks_to_remove.append(track_id)
+                        tracks_to_move.append(track_id)
                 elif track['age'] > track['max_age']:
-                    tracks_to_remove.append(track_id)
+                    tracks_to_move.append(track_id)
         
-        for track_id in tracks_to_remove:
-            del self.tracks[track_id]
-            if track_id in self.velocity_history:
-                del self.velocity_history[track_id]
+        # Move tracks to lost_tracks
+        for track_id in tracks_to_move:
+            self._move_to_lost_tracks(track_id)
             if track_id in self.occlusion_candidates:
                 del self.occlusion_candidates[track_id]
+        
+        # Update lost tracks and remove very old ones
+        lost_to_remove = []
+        for track_id, track_data in self.lost_tracks.items():
+            track_data['disappeared_frames'] += 1
+            if track_data['disappeared_frames'] > self.max_disappeared:
+                lost_to_remove.append(track_id)
+        
+        for track_id in lost_to_remove:
+            del self.lost_tracks[track_id]
+            if track_id in self.velocity_history:
+                del self.velocity_history[track_id]
+
+    def _create_new_track(self, detection, current_time, recovered_id=None):
+        """Create a new track or recover a lost one"""
+        if recovered_id is not None:
+            track_id = recovered_id
+            # Restore from lost tracks
+            if recovered_id in self.lost_tracks:
+                self.tracks[track_id] = self.lost_tracks[recovered_id].copy()
+                self.tracks[track_id]['age'] = 0
+                self.tracks[track_id]['disappeared_frames'] = 0
+                del self.lost_tracks[recovered_id]
+        else:
+            self.track_id_count += 1
+            track_id = self.track_id_count
+            self.tracks[track_id] = {
+                'age': 0,
+                'hits': 1,
+                'max_age': self.max_age,
+                'disappeared_frames': 0
+            }
+        
+        # Update with current detection
+        self.tracks[track_id].update({
+            'bbox': detection['bbox'],
+            'class_id': detection['class_id'],
+            'label': detection['label'],
+            'confidence': detection['confidence']
+        })
+        
+        center = self._get_center(detection['bbox'])
+        if track_id not in self.velocity_history:
+            self.velocity_history[track_id] = []
+        self.velocity_history[track_id].append({
+            'center': center,
+            'time': current_time
+        })
+        
+        # Keep history per label
+        label = detection['label']
+        if label not in self.label_track_history:
+            self.label_track_history[label] = []
+        if track_id not in self.label_track_history[label]:
+            self.label_track_history[label].append(track_id)
+        
+        return track_id
 
     def update(self, detections):
-        """Update tracks with new detections, handling fast movements and occlusions"""
+        """Update tracks with new detections"""
         current_time = time.time()
         
-        # Initialize if no tracks exist
-        if not self.tracks:
+        if not self.tracks and not self.lost_tracks:
             for det in detections:
-                self.track_id_count += 1
-                center = self._get_center(det['bbox'])
-                self.tracks[self.track_id_count] = {
-                    'bbox': det['bbox'],
-                    'class_id': det['class_id'],
-                    'label': det['label'],
-                    'confidence': det['confidence'],
-                    'age': 0,
-                    'hits': 1,
-                    'max_age': self.max_age
-                }
-                self.velocity_history[self.track_id_count] = [{
-                    'center': center,
-                    'time': current_time
-                }]
+                self._create_new_track(det, current_time)
             return [{'id': k, **v} for k, v in self.tracks.items()]
         
-        # Match detections to existing tracks
         matched_tracks = set()
         matched_detections = set()
         
-        # First pass: Match based on predicted positions for fast-moving objects
+        # First pass: Match with active tracks using predicted positions
         for track_id, track in self.tracks.items():
             predicted_pos = self._predict_next_position(track_id)
             if predicted_pos:
@@ -1907,13 +1987,13 @@ class EnhancedTracker:
                     det_center = self._get_center(det['bbox'])
                     distance = self._calculate_distance(predicted_pos, det_center)
                     
-                    # Match based on predicted position for fast movements
-                    if distance < 100:  # Larger threshold for fast movements
+                    if distance < 100:
                         matched_tracks.add(track_id)
                         matched_detections.add(i)
                         self._update_track(track_id, detections[i], current_time)
+                        break
         
-        # Second pass: Traditional IOU matching for remaining detections
+        # Second pass: IOU matching with active tracks
         for track_id, track in self.tracks.items():
             if track_id in matched_tracks:
                 continue
@@ -1935,39 +2015,51 @@ class EnhancedTracker:
                 matched_detections.add(best_match)
                 self._update_track(track_id, detections[best_match], current_time)
         
-        # Handle potential occlusions
+        # Handle occlusions
         unmatched_tracks = set(self.tracks.keys()) - matched_tracks
         self._handle_occlusions(unmatched_tracks, detections)
         
-        # Create new tracks for unmatched detections
+        # Third pass: Try to recover lost tracks for unmatched detections
         for i, det in enumerate(detections):
             if i in matched_detections:
                 continue
-                
-            self.track_id_count += 1
-            center = self._get_center(det['bbox'])
-            self.tracks[self.track_id_count] = {
-                'bbox': det['bbox'],
-                'class_id': det['class_id'],
-                'label': det['label'],
-                'confidence': det['confidence'],
-                'age': 0,
-                'hits': 1,
-                'max_age': self.max_age
-            }
-            self.velocity_history[self.track_id_count] = [{
-                'center': center,
-                'time': current_time
-            }]
+            
+            # Try to find a matching lost track
+            recovered_id = self._try_recover_lost_track(det)
+            
+            if recovered_id is not None:
+                # Recover the lost track
+                self._create_new_track(det, current_time, recovered_id=recovered_id)
+                matched_detections.add(i)
+            else:
+                # Create completely new track
+                self._create_new_track(det, current_time)
+                matched_detections.add(i)
         
-        # Update and remove old tracks
+        # Update track ages and manage lost tracks
         self._update_track_ages(matched_tracks)
         
-        # Return active tracks
+        # Return active tracks that meet criteria
         return [{'id': k, **v} for k, v in self.tracks.items() 
                 if v['hits'] >= self.min_hits and v['age'] <= v['max_age']]
 
-tracker = EnhancedTracker(max_age=1, min_hits=1, iou_threshold=0.3)
+    def get_track_info(self):
+        """Get information about all tracks (active and lost)"""
+        return {
+            'active_tracks': len(self.tracks),
+            'lost_tracks': len(self.lost_tracks),
+            'total_tracks_created': self.track_id_count,
+            'tracks_by_label': {
+                label: [tid for tid in track_ids if tid in self.tracks or tid in self.lost_tracks]
+                for label, track_ids in self.label_track_history.items()
+            }
+        }
+
+
+# Initialize tracker globally or per stream
+# max_disappeared: frames to keep lost tracks before permanent deletion
+tracker = EnhancedTracker(max_age=3, min_hits=2, iou_threshold=0.3, max_disappeared=30)
+
 
 
 def detection_callback(pad, info, callback_data):
