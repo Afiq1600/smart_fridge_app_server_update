@@ -1545,8 +1545,8 @@ def analyze_movement_direction(track_id, center, tracking_data, camera_id, globa
     negative_movements = sum(1 for d in movement_directions if d < 0)
     consistency_ratio = max(positive_movements, negative_movements) / len(movement_directions)
     
-    # Require 20% of movements in the same direction
-    if consistency_ratio < 0.2:
+    # Require 80% of movements in the same direction
+    if consistency_ratio < 0.8:
         return None  # Movement too erratic (up-down-up-down)
     
     # ===== CHECK 4: Average Movement Threshold =====
