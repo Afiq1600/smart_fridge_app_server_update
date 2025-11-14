@@ -424,6 +424,13 @@ def display_user_data_frame(user_data):
     dataset_name = f"hailo_detection_{timestamp}_{transaction_id}"
     filename = os.path.join(video_dir, f"{dataset_name}.avi")
     
+    # FPS calculation variables
+    frame_count = 0
+    fps_start_time = None
+    fps_calculated = False
+    actual_fps = 13.0  # Default fallback
+    fps_sample_frames = 30  # Calculate FPS over first 30 frames
+    
     try:
         while not user_data.shutdown_event.is_set():
             # Check if door is closed
@@ -431,14 +438,29 @@ def display_user_data_frame(user_data):
             
             frame = user_data.get_frame()
             if frame is not None:
-                # Create video writer on first frame to get dimensions
-                if output_video is None:
-                    height, width = frame.shape[:2]
-                    output_video = cv2.VideoWriter(filename, fourcc, 13.0, (width, height), isColor=True)
-                    print(f"Started recording to: {filename}")
+                # Start timing on first frame
+                if fps_start_time is None:
+                    fps_start_time = time.time()
                 
-                # Write frame to video
-                output_video.write(frame.copy())
+                frame_count += 1
+                
+                # Calculate actual FPS after collecting sample frames
+                if not fps_calculated and frame_count >= fps_sample_frames:
+                    elapsed_time = time.time() - fps_start_time
+                    actual_fps = frame_count / elapsed_time
+                    fps_calculated = True
+                    print(f"Detected actual FPS: {actual_fps:.2f}")
+                
+                # Create video writer after FPS is calculated
+                if output_video is None and fps_calculated:
+                    height, width = frame.shape[:2]
+                    output_video = cv2.VideoWriter(filename, fourcc, actual_fps, (width, height), isColor=True)
+                    print(f"Started recording to: {filename}")
+                    print(f"Recording at {actual_fps:.2f} FPS")
+                
+                # Write frame to video (only after video writer is created)
+                if output_video is not None:
+                    output_video.write(frame.copy())
                 
                 cv2.imshow("Hailo Detection", frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -452,6 +474,7 @@ def display_user_data_frame(user_data):
         if output_video is not None:
             output_video.release()
             print(f"Video saved successfully to: {filename}")
+            print(f"Total frames recorded: {frame_count}")
         
         try:
             # Clean GPIO
