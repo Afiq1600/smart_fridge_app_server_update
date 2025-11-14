@@ -434,7 +434,7 @@ def display_user_data_frame(user_data):
                 # Create video writer on first frame to get dimensions
                 if output_video is None:
                     height, width = frame.shape[:2]
-                    output_video = cv2.VideoWriter(filename, fourcc, 14.0, (width, height), isColor=True)
+                    output_video = cv2.VideoWriter(filename, fourcc, 13.0, (width, height), isColor=True)
                     print(f"Started recording to: {filename}")
                 
                 # Write frame to video
