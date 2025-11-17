@@ -1529,7 +1529,7 @@ def analyze_movement_direction(track_id, center, tracking_data, camera_id, globa
     global_movement_history[global_id].appendleft((center, camera_id))
     
     # Wait until we have enough frames to analyze for this camera
-    if len(camera_movement_history[camera_id][track_id]) < 3:
+    if len(camera_movement_history[camera_id][track_id]) < 5:
         return None
     
     # ===== CHECK 1: Bounding Box Stability =====
@@ -1550,8 +1550,8 @@ def analyze_movement_direction(track_id, center, tracking_data, camera_id, globa
     last_y = camera_movement_history[camera_id][track_id][0][1]    # Newest position
     total_displacement = abs(last_y - first_y)
     
-    # Require at least 40 pixels total movement over 5 frames
-    DISPLACEMENT_THRESHOLD = 40
+    # Require at least 30 pixels total movement over 5 frames
+    DISPLACEMENT_THRESHOLD = 30
     if total_displacement < DISPLACEMENT_THRESHOLD:
         return None  # Not enough movement, likely just jittering
     
@@ -1583,7 +1583,7 @@ def analyze_movement_direction(track_id, center, tracking_data, camera_id, globa
     avg_movement = total_movement / 4  # We have 4 intervals between 5 points
     
     # Use a threshold to determine significant movement per frame
-    FRAME_MOVEMENT_THRESHOLD = 1
+    FRAME_MOVEMENT_THRESHOLD = 5
     if abs(avg_movement) < FRAME_MOVEMENT_THRESHOLD:
         return None
     
@@ -1870,7 +1870,7 @@ async def run_tracking(websocket: WebSocket):
             print("\n" + "="*50)
             print("STARTING IMAGE CAPTURE PROCESS")
             print("="*50)
-            print(f"Total images to capture: {image_count * 2} ({image_count} per camera)")
+            print(f"Total images to capture:  ({image_count} per camera)")
             
             # Get alert sound paths
             alert_dir = "sounds/product_upload_alerts"
@@ -1885,22 +1885,9 @@ async def run_tracking(websocket: WebSocket):
             print("-"*30)
             camera1_images = capture_images(0, image_count)
             
-            # Small break between cameras
-            print("\n" + "="*20)
-            print("SWITCHING TO CAMERA 2")
-            print("="*20)
             
-            # Play camera switch alert
-            tts_manager.play_mp3_sync(f"{alert_dir}/camera_switch.mp3", volume=0.8)
-            time.sleep(2)
         
-            # Capture from camera2 (/dev/video2) SECOND
-            print("\n" + "-"*30)
-            print("CAMERA 2 CAPTURE PHASE")
-            print("-"*30)
-            camera2_images = capture_images(2, image_count)
-        
-            if camera1_images and camera2_images:
+            if camera1_images:
                 print("\nAll images captured successfully!")
                 
                 # Play completion alert
@@ -1908,13 +1895,13 @@ async def run_tracking(websocket: WebSocket):
             
                 # Upload images to API
                 print("\nUploading images to API...")
-                if upload_images_to_api(camera1_images, camera2_images, machine_id, 
+                if upload_images_to_api(camera1_images, machine_id, 
                                        machine_identifier, user_id, product_name, image_count):
                     print("Images uploaded successfully!")
                     
                     # Delete all captured images after successful upload
                     print("\nDeleting captured images...")
-                    all_images = camera1_images + camera2_images
+                    all_images = camera1_images 
                     delete_images(all_images)
                     
                     # Play success alert
@@ -2142,7 +2129,7 @@ def capture_images(device_id, num_images=3):
 
 
 
-def upload_images_to_api(camera1_images, camera2_images, machine_id, machine_identifier, user_id, product_name, image_count):
+def upload_images_to_api(camera1_images, machine_id, machine_identifier, user_id, product_name, image_count):
     """Upload images to the API."""
     api_url = "https://stg-sfapi.nuboxtech.com/index.php/mobile_app/product/Product/upload_product_images"
     
@@ -2166,17 +2153,13 @@ def upload_images_to_api(camera1_images, camera2_images, machine_id, machine_ide
     opened_files = []  # Keep track of opened file handles
     
     try:
-        # Add Fantech camera images
+        # Add USB camera images
         for i, img_path in enumerate(camera1_images):
             file_handle = open(img_path, 'rb')
             opened_files.append(file_handle)
             files.append(('image[]', (f'camera1{i}.jpg', file_handle, 'image/jpeg')))
         
-        # Add USB camera images
-        for i, img_path in enumerate(camera2_images):
-            file_handle = open(img_path, 'rb')
-            opened_files.append(file_handle)
-            files.append(('image[]', (f'camera2{i}.jpg', file_handle, 'image/jpeg')))
+        
         
         # Upload to API
         response = requests.post(
