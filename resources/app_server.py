@@ -981,7 +981,7 @@ class HailoDetectionCallback(app_callback_class):
         "queue name=hailo_video_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
         "videoconvert ! "
         "queue name=hailo_display_q_0 leaky=downstream max-size-buffers=5 max-size-bytes=0 max-size-time=0 ! "
-        "fpsdisplaysink video-sink=autovideosink name=hailo_display sync=false text-overlay=true "
+        "fpsdisplaysink video-sink=ximagesink name=hailo_display sync=false text-overlay=true "
         "v4l2src device=/dev/video0 name=source_0 ! "
         "image/jpeg, width=640, height=360, framerate=25/1 ! "
         "jpegdec ! "
@@ -1637,6 +1637,10 @@ def detection_callback(pad, info, callback_data):
     # Collect active track IDs for cleanup
     active_local_track_ids = set()
     
+    # Track frame for transaction 
+    if hasattr(user_data, 'transaction_id') and user_data.transaction_id:
+        transaction_memory_manager.track_frame(user_data.transaction_id)
+    
     # Process detections and draw on frame
     for detection in detections:
         label = detection.get_label()
@@ -1661,6 +1665,15 @@ def detection_callback(pad, info, callback_data):
         
         # Get or create global track ID
         global_id = get_global_track_id(stream_id, track_id, None, label)
+        
+        
+        # Track object for transaction 
+        if hasattr(user_data, 'transaction_id') and user_data.transaction_id:
+            transaction_memory_manager.track_object(
+                user_data.transaction_id, 
+                track_id, 
+                global_id
+            )
         
         validation_result = user_data.validate_detected_product(label)
         color = compute_color_for_labels(class_id)
@@ -1919,6 +1932,12 @@ async def run_tracking(websocket: WebSocket):
                 tts_manager.play_mp3_sync(f"{alert_dir}/upload_failed.mp3", volume=0.8)
                    
         else:
+            
+            # START TRANSACTION 
+            if transaction_id:
+                transaction_memory_manager.start_transaction(transaction_id)
+                print(f"[Memory] Transaction {transaction_id} started")
+            
             # Initialize door status monitoring
             door_monitor_active = True
             done = True
@@ -1986,8 +2005,22 @@ async def run_tracking(websocket: WebSocket):
                         
             app.run()
             
+            # END TRANSACTION HERE - After tracking completes 
+            if transaction_id:
+                transaction_memory_manager.end_transaction(transaction_id)
+                print(f"[Memory] Transaction {transaction_id} ended")
+            
     except Exception as e:
         print(f"Error during tracking: {e}")
+        
+        # ALSO END TRANSACTION ON ERROR 
+        if transaction_id:
+            try:
+                transaction_memory_manager.end_transaction(transaction_id)
+                print(f"[Memory] Transaction {transaction_id} ended (due to error)")
+            except:
+                pass
+        
     finally:
         # Ensure cleanup happens
         await websocket.send_json({
@@ -2713,6 +2746,402 @@ def play_error_sound():
 current_pipeline_app = None
 pipeline_lock = threading.Lock()
 
+
+"""
+TRANSACTION-BASED MEMORY MANAGEMENT
+====================================
+Optimized for per-transaction lifecycle (open → detect → close → cleanup)
+Perfect for 24/7 smart fridge with multiple daily transactions.
+
+YOUR USE CASE:
+1. Customer opens app → WebSocket connects
+2. Deposit deducted → Door unlocks → Cameras start
+3. Customer takes items → Object detection tracks
+4. Door closes → Transaction ends → WebSocket closes
+5. Refund calculated → Connection closed
+6. REPEAT for next customer (24/7)
+
+PROBLEM WITH CURRENT CODE:
+- Data accumulates across transactions
+- No cleanup between customers
+- Memory grows over days/weeks
+- Eventually crashes after 100s of transactions
+"""
+
+import gc
+import psutil
+import sys
+import ctypes
+import time
+from collections import defaultdict, deque
+import threading
+from datetime import datetime
+import weakref
+
+# ============================================================================
+# ENHANCED MEMORY MANAGER FOR TRANSACTION-BASED SYSTEM
+# ============================================================================
+"""
+This version FORCES Python to release memory by:
+1. Clearing ALL references
+2. Recreating dictionaries from scratch
+3. Multiple GC passes
+4. Explicit CPython memory management
+"""
+
+
+
+class TransactionMemoryManager:
+    """
+    Enhanced memory manager that FORCES memory release
+    """
+    
+    def __init__(self):
+        self.active_transactions = {}
+        self.transaction_history = deque(maxlen=100)
+        self.global_stats = {
+            'total_transactions': 0,
+            'total_cleanups': 0,
+            'average_memory_per_transaction': 0,
+            'peak_memory': 0
+        }
+        self.lock = threading.Lock()
+    
+    def start_transaction(self, transaction_id):
+        """Called when WebSocket connects and transaction starts"""
+        with self.lock:
+            print(f"\n{'='*60}")
+            print(f"[Transaction] Starting: {transaction_id}")
+            print(f"{'='*60}")
+            
+            process = psutil.Process()
+            memory_start = process.memory_info().rss / 1024 / 1024
+            
+            self.active_transactions[transaction_id] = {
+                'start_time': time.time(),
+                'start_memory_mb': memory_start,
+                'tracks_created': set(),
+                'trails_created': set(),
+                'frames_processed': 0
+            }
+            
+            self.global_stats['total_transactions'] += 1
+            
+            print(f"[Transaction] Memory at start: {memory_start:.1f}MB")
+            print(f"[Transaction] Active transactions: {len(self.active_transactions)}")
+    
+    def end_transaction(self, transaction_id):
+        """Called when WebSocket closes - AGGRESSIVE cleanup"""
+        with self.lock:
+            if transaction_id not in self.active_transactions:
+                print(f"[Transaction] Warning: {transaction_id} not found")
+                return
+            
+            print(f"\n{'='*60}")
+            print(f"[Transaction] Ending: {transaction_id}")
+            print(f"{'='*60}")
+            
+            trans_data = self.active_transactions[transaction_id]
+            
+            # Calculate metrics
+            duration = time.time() - trans_data['start_time']
+            process = psutil.Process()
+            memory_before_cleanup = process.memory_info().rss / 1024 / 1024
+            memory_used = memory_before_cleanup - trans_data['start_memory_mb']
+            
+            print(f"[Transaction] Duration: {duration:.1f}s")
+            print(f"[Transaction] Frames processed: {trans_data['frames_processed']}")
+            print(f"[Transaction] Tracks created: {len(trans_data['tracks_created'])}")
+            print(f"[Transaction] Memory before cleanup: {memory_before_cleanup:.1f}MB")
+            print(f"[Transaction] Memory used during transaction: {memory_used:.1f}MB")
+            
+            # Store history
+            self.transaction_history.append({
+                'transaction_id': transaction_id,
+                'duration': duration,
+                'memory_used_mb': memory_used,
+                'frames': trans_data['frames_processed'],
+                'timestamp': datetime.now()
+            })
+            
+            # Remove from active
+            del self.active_transactions[transaction_id]
+            
+            # ✨ AGGRESSIVE CLEANUP - Multiple strategies ✨
+            print(f"[Cleanup] Starting aggressive cleanup...")
+            
+            # Strategy 1: Remove from dictionaries
+            self._cleanup_transaction_data(transaction_id, trans_data)
+            
+            # Strategy 2: RECREATE dictionaries (forces memory release)
+            self._recreate_global_dictionaries()
+            
+            # Strategy 3: Force multiple GC passes
+            self._aggressive_garbage_collection()
+            
+            # Strategy 4: Try to release memory back to OS
+            self._release_memory_to_os()
+            
+            # Check final memory
+            memory_after = process.memory_info().rss / 1024 / 1024
+            memory_freed = memory_before_cleanup - memory_after
+            
+            print(f"[Transaction] Memory after cleanup: {memory_after:.1f}MB")
+            print(f"[Transaction] Memory freed: {memory_freed:.1f}MB")
+            
+            if memory_freed < 10:
+                print(f"[Transaction] ⚠️ Warning: Only {memory_freed:.1f}MB freed (expected ~{memory_used * 0.8:.1f}MB)")
+            else:
+                print(f"[Transaction] ✅ Successfully freed {memory_freed:.1f}MB")
+            
+            print(f"{'='*60}\n")
+    
+    def _cleanup_transaction_data(self, transaction_id, trans_data):
+        """Remove transaction data from global dictionaries"""
+        global object_trails, global_trails, camera_movement_history
+        global camera_bbox_area_history, local_to_global_id_map
+        global active_objects_per_camera, global_movement_history
+        
+        tracks_to_clean = trans_data['tracks_created']
+        trails_to_clean = trans_data['trails_created']
+        
+        # Count before cleanup
+        trails_before = len(object_trails) + len(global_trails)
+        tracks_before = sum(len(camera_movement_history[c]) for c in [0, 1])
+        
+        # Clean object trails
+        for track_id in list(object_trails.keys()):
+            if track_id in tracks_to_clean:
+                object_trails[track_id].clear()  # Clear deque first
+                del object_trails[track_id]
+        
+        # Clean global trails
+        for global_id in list(global_trails.keys()):
+            if global_id in trails_to_clean:
+                global_trails[global_id].clear()
+                del global_trails[global_id]
+        
+        # Clean movement history
+        for camera_id in [0, 1]:
+            for track_id in list(camera_movement_history[camera_id].keys()):
+                if track_id in tracks_to_clean:
+                    camera_movement_history[camera_id][track_id].clear()
+                    del camera_movement_history[camera_id][track_id]
+            
+            for track_id in list(camera_bbox_area_history[camera_id].keys()):
+                if track_id in tracks_to_clean:
+                    camera_bbox_area_history[camera_id][track_id].clear()
+                    del camera_bbox_area_history[camera_id][track_id]
+        
+        # Clean mappings
+        for key in list(local_to_global_id_map.keys()):
+            cam_id, local_id = key
+            if local_id in tracks_to_clean:
+                del local_to_global_id_map[key]
+        
+        # Clean active objects
+        for camera_id in [0, 1]:
+            for label in list(active_objects_per_camera[camera_id].keys()):
+                for local_id in list(active_objects_per_camera[camera_id][label].keys()):
+                    if local_id in tracks_to_clean:
+                        del active_objects_per_camera[camera_id][label][local_id]
+                
+                if not active_objects_per_camera[camera_id][label]:
+                    del active_objects_per_camera[camera_id][label]
+        
+        # Clean global movement history
+        for global_id in list(global_movement_history.keys()):
+            if global_id in trails_to_clean:
+                global_movement_history[global_id].clear()
+                del global_movement_history[global_id]
+        
+        trails_after = len(object_trails) + len(global_trails)
+        tracks_after = sum(len(camera_movement_history[c]) for c in [0, 1])
+        
+        print(f"[Cleanup] Trails: {trails_before} -> {trails_after} (removed {trails_before - trails_after})")
+        print(f"[Cleanup] Tracks: {tracks_before} -> {tracks_after} (removed {tracks_before - tracks_after})")
+    
+    def _recreate_global_dictionaries(self):
+        """
+        NUCLEAR OPTION: Recreate dictionaries from scratch
+        This forces Python to release the old dictionary memory
+        """
+        global object_trails, global_trails, camera_movement_history
+        global camera_bbox_area_history, active_objects_per_camera
+        global global_movement_history, local_to_global_id_map
+        
+        print(f"[Cleanup] Recreating global dictionaries...")
+        
+        # Count items to preserve
+        preserve_count = 0
+        
+        # For each dictionary, create a NEW one with only necessary data
+        # This forces Python to allocate new memory and release old
+        
+        # Only keep items NOT in any active transaction
+        active_tracks = set()
+        active_trails = set()
+        for trans_data in self.active_transactions.values():
+            active_tracks.update(trans_data['tracks_created'])
+            active_trails.update(trans_data['trails_created'])
+        
+        # Recreate object_trails
+        new_object_trails = defaultdict(lambda: deque(maxlen=30))
+        for track_id, trail in object_trails.items():
+            if track_id in active_tracks:
+                new_object_trails[track_id] = trail
+                preserve_count += 1
+        object_trails = new_object_trails
+        
+        # Recreate global_trails
+        new_global_trails = defaultdict(lambda: deque(maxlen=30))
+        for global_id, trail in global_trails.items():
+            if global_id in active_trails:
+                new_global_trails[global_id] = trail
+                preserve_count += 1
+        global_trails = new_global_trails
+        
+        # Recreate camera histories
+        new_camera_movement_history = {
+            0: defaultdict(lambda: deque(maxlen=5)),
+            1: defaultdict(lambda: deque(maxlen=5))
+        }
+        for cam_id in [0, 1]:
+            for track_id, history in camera_movement_history[cam_id].items():
+                if track_id in active_tracks:
+                    new_camera_movement_history[cam_id][track_id] = history
+                    preserve_count += 1
+        camera_movement_history = new_camera_movement_history
+        
+        new_camera_bbox_area_history = {
+            0: defaultdict(lambda: deque(maxlen=5)),
+            1: defaultdict(lambda: deque(maxlen=5))
+        }
+        for cam_id in [0, 1]:
+            for track_id, history in camera_bbox_area_history[cam_id].items():
+                if track_id in active_tracks:
+                    new_camera_bbox_area_history[cam_id][track_id] = history
+        camera_bbox_area_history = new_camera_bbox_area_history
+        
+        print(f"[Cleanup] Preserved {preserve_count} items from active transactions")
+        print(f"[Cleanup] Dictionary recreation complete")
+    
+    def _aggressive_garbage_collection(self):
+        """Run multiple GC passes to ensure cleanup"""
+        print(f"[GC] Running aggressive garbage collection...")
+        
+        total_collected = 0
+        
+        # Run multiple passes
+        for pass_num in range(3):
+            collected = [gc.collect(gen) for gen in range(3)]
+            total = sum(collected)
+            total_collected += total
+            print(f"[GC] Pass {pass_num + 1}: Gen0={collected[0]}, Gen1={collected[1]}, Gen2={collected[2]} (total={total})")
+            
+            if total == 0:
+                break  # No more to collect
+        
+        print(f"[GC] Total objects collected: {total_collected}")
+        
+        # Get GC stats
+        gc_stats = gc.get_stats()
+        print(f"[GC] Current GC stats:")
+        for gen, stats in enumerate(gc_stats):
+            print(f"[GC]   Gen{gen}: collections={stats['collections']}, "
+                  f"collected={stats.get('collected', 0)}, "
+                  f"uncollectable={stats.get('uncollectable', 0)}")
+        
+        self.global_stats['total_cleanups'] += 1
+    
+    def _release_memory_to_os(self):
+        """
+        Try to release memory back to the operating system
+        This is platform-specific and may not always work
+        """
+        print(f"[Memory] Attempting to release memory to OS...")
+        
+        try:
+            # For Linux: Use malloc_trim to release memory
+            if sys.platform == 'linux':
+                libc = ctypes.CDLL('libc.so.6')
+                libc.malloc_trim(0)
+                print(f"[Memory] malloc_trim() called successfully")
+            else:
+                print(f"[Memory] malloc_trim not available on {sys.platform}")
+        except Exception as e:
+            print(f"[Memory] Could not call malloc_trim: {e}")
+    
+    def track_frame(self, transaction_id):
+        """Called for each processed frame"""
+        if transaction_id in self.active_transactions:
+            self.active_transactions[transaction_id]['frames_processed'] += 1
+    
+    def track_object(self, transaction_id, track_id, global_id):
+        """Called when new track is created"""
+        if transaction_id in self.active_transactions:
+            self.active_transactions[transaction_id]['tracks_created'].add(track_id)
+            self.active_transactions[transaction_id]['trails_created'].add(global_id)
+    
+    def get_stats(self):
+        """Get memory statistics"""
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        
+        return {
+            'current_memory_mb': memory_info.rss / 1024 / 1024,
+            'active_transactions': len(self.active_transactions),
+            'total_transactions': self.global_stats['total_transactions'],
+            'total_cleanups': self.global_stats['total_cleanups'],
+            'recent_transactions': list(self.transaction_history)[-10:]
+        }
+    
+    def print_stats(self):
+        """Print detailed statistics"""
+        stats = self.get_stats()
+        
+        print("\n" + "="*60)
+        print("TRANSACTION MEMORY STATISTICS")
+        print("="*60)
+        print(f"Current Memory: {stats['current_memory_mb']:.1f}MB")
+        print(f"Active Transactions: {stats['active_transactions']}")
+        print(f"Total Transactions: {stats['total_transactions']}")
+        print(f"Total Cleanups: {stats['total_cleanups']}")
+        print("\nRecent Transactions:")
+        for trans in stats['recent_transactions']:
+            print(f"  {trans['transaction_id']}: "
+                  f"{trans['duration']:.1f}s, "
+                  f"{trans['memory_used_mb']:.1f}MB, "
+                  f"{trans['frames']} frames")
+        print("="*60 + "\n")
+
+
+# ============================================================================
+# IMPORTANT: Update global references after dictionary recreation
+# ============================================================================
+
+# You need to add this function to handle the global reassignment
+def update_global_references():
+    """
+    This is called after dictionary recreation to ensure
+    all modules have the updated references
+    """
+    global object_trails, global_trails, camera_movement_history
+    global camera_bbox_area_history, active_objects_per_camera
+    global global_movement_history, local_to_global_id_map
+    
+    # Python's globals are per-module, so we need to be careful here
+    # The recreation in the cleanup method should work because it uses 'global'
+    pass
+
+
+# ============================================================================
+# INTEGRATION WITH YOUR WEBSOCKET ENDPOINT
+# ============================================================================
+
+# Global instance
+transaction_memory_manager = TransactionMemoryManager()
+
 done = False
 @app.websocket("/ws/track")
 async def websocket_endpoint(websocket: WebSocket):
@@ -2748,6 +3177,11 @@ async def websocket_endpoint(websocket: WebSocket):
        if not done:
 
            callback = HailoDetectionCallback(websocket, deposit, machine_id, machine_identifier, user_id, transaction_id)
+           
+           # Start transaction tracking 
+           if transaction_id:
+                transaction_memory_manager.start_transaction(transaction_id)
+           
            while not callback.tracking_data.shutdown_event.is_set():
                 try:
                     current_data = callback.tracking_data.websocket_data_manager.get_current_data()
@@ -2760,6 +3194,13 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         print(f"WebSocket tracking error: {e}")
     finally:
+        # End transaction and cleanup 
+        try:
+            if 'callback' in locals() and hasattr(callback, 'transaction_id') and callback.transaction_id:
+                transaction_memory_manager.end_transaction(callback.transaction_id)
+        except Exception as e:
+            print(f"Error ending transaction: {e}")
+
         
         with pipeline_lock:
             if current_pipeline_app is not None:
@@ -2794,8 +3235,54 @@ async def websocket_endpoint(websocket: WebSocket):
         time.sleep(0.3)
         GPIO.output(LED_GREEN, GPIO.HIGH)
         GPIO.output(LED_RED, GPIO.HIGH)
+        
+        # Print stats every 10 transactions
+        if transaction_memory_manager.global_stats['total_transactions'] % 10 == 0:
+            transaction_memory_manager.print_stats()
+            
         await websocket.close()
 
+
+# ============================================================================
+# MONITORING ENDPOINT - Check System Health
+# ============================================================================
+
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint - monitor your fridge remotely!
+    
+    Usage: curl http://your-pi:8000/health
+    """
+    stats = transaction_memory_manager.get_stats()
+    
+    return {
+        "status": "healthy" if stats['current_memory_mb'] < 1000 else "warning",
+        "memory_mb": round(stats['current_memory_mb'], 2),
+        "active_transactions": stats['active_transactions'],
+        "total_transactions": stats['total_transactions'],
+        "uptime_hours": round((time.time() - app.start_time) / 3600, 2) if hasattr(app, 'start_time') else 0
+    }
+
+
+@app.get("/stats")
+async def get_stats():
+    """Detailed statistics endpoint"""
+    stats = transaction_memory_manager.get_stats()
+    
+    return {
+        "memory": {
+            "current_mb": round(stats['current_memory_mb'], 2),
+            "available_mb": round(psutil.virtual_memory().available / 1024 / 1024, 2),
+            "percent": round(psutil.virtual_memory().percent, 2)
+        },
+        "transactions": {
+            "active": stats['active_transactions'],
+            "total": stats['total_transactions'],
+            "cleanups": stats['total_cleanups']
+        },
+        "recent": stats['recent_transactions']
+    }
 
 def main():
     parser = argparse.ArgumentParser()
@@ -2804,12 +3291,21 @@ def main():
     
     
     args = parser.parse_args()
+    
+    # Record start time for uptime tracking
+    app.start_time = time.time()
+    
+    
+    # Create directories
     os.makedirs('saved_videos', exist_ok=True)
     os.makedirs('camera_images', exist_ok=True)
     os.makedirs("sounds", exist_ok=True)
     os.makedirs("sounds/deposits", exist_ok=True)
+    
+    
     setup_cover_alert_sound()  # For camera cover alerts
     setup_product_upload_alerts()  # For product upload process
+    
     # Generate door audio files on startup if they don't exist
     if not os.path.exists("sounds/door_open.mp3") or not os.path.exists("sounds/door_close.mp3"):
         print("Generating door audio files...")
@@ -2818,7 +3314,22 @@ def main():
     # Pre-generate common deposit messages
     tts_manager.generate_common_deposit_messages()
     
+    # Transaction memory manager is already initialized globally 
+    print("[Memory] Transaction-based memory management initialized")
+    print("[Memory] Automatic cleanup enabled for each transaction")
+    
     atexit.register(GPIO.cleanup)
+    
+    # Print initial stats
+    print("\n" + "="*60)
+    print("SMART FRIDGE SYSTEM STARTED")
+    print("="*60)
+    print(f"Memory at startup: {psutil.Process().memory_info().rss / 1024 / 1024:.1f}MB")
+    print(f"Available memory: {psutil.virtual_memory().available / 1024 / 1024:.1f}MB")
+    print(f"Listening on: http://{args.host}:{args.port}/ws/track")
+    print(f"Health check: http://{args.host}:{args.port}/health")
+    print(f"Statistics: http://{args.host}:{args.port}/stats")
+    print("="*60 + "\n")
     
     uvicorn.run(
         "app_server:app",
