@@ -35,7 +35,7 @@ WORKFLOW:
 
 AUTHOR: Afiq
 VERSION: 1.0
-LAST UPDATED: 1/12/2025
+LAST UPDATED: 2/12/2025
 =====================================================================
 """
 
@@ -54,6 +54,7 @@ import numpy as np
 # System and File Operations
 import argparse
 import os
+import glob
 import json
 import time
 from datetime import datetime
